@@ -1,26 +1,43 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::fs;
 
+use nipdf::ObjectValueError;
+use nipdf::file::File as NipdfFile;
+use nipdf_render::{RenderOptionBuilder, render_page};
 use pdf::content::{Matrix, Op, Point, Rect, TextDrawAdjusted};
 use pdf::error::PdfError;
 use pdf::file::{CachedFile, FileOptions};
 use pdf::font::{Font, FontData, FontDescriptor, ToUnicodeMap, Widths};
 use pdf::object::Resolve;
-use pdf::object::{ColorSpace, ImageXObject, MaybeRef, Page, Resources, XObject};
+use pdf::object::{ColorSpace, ImageXObject, MaybeRef, Page as PdfPage, Resources, XObject};
 use pdf::primitive::PdfString;
 use png::{BitDepth, ColorType, Encoder};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
+
+use image::imageops;
 
 /// Convert a [`PdfError`] into a Python runtime error.
 fn pdf_err(err: PdfError) -> PyErr {
     PyRuntimeError::new_err(err.to_string())
 }
 
+fn nipdf_obj_err(err: ObjectValueError) -> PyErr {
+    PyRuntimeError::new_err(err.to_string())
+}
+
 /// Open a PDF file using the `pdf` crate with the default cached options.
 fn open_pdf(path: &str) -> Result<CachedFile<Vec<u8>>, PdfError> {
     FileOptions::cached().open(path)
+}
+
+fn open_nipdf(path: &str) -> PyResult<NipdfFile> {
+    let data = fs::read(path).map_err(|err| {
+        PyRuntimeError::new_err(format!("failed to read PDF '{}': {}", path, err))
+    })?;
+    NipdfFile::parse(data, "").map_err(nipdf_obj_err)
 }
 
 /// Lightweight representation of a text chunk extracted from a page.
@@ -373,7 +390,7 @@ fn unit_square_bounds(matrix: &Matrix) -> (f32, f32, f32, f32) {
 }
 
 fn collect_fonts(
-    page: &Page,
+    page: &PdfPage,
     resolver: &impl Resolve,
 ) -> Result<HashMap<String, ResolvedFont>, PdfError> {
     let mut fonts = HashMap::new();
@@ -687,6 +704,117 @@ struct PositionedImage {
     image: ImageResult,
 }
 
+struct RegionImage {
+    index: usize,
+    page_index: usize,
+    input_bbox: (f32, f32, f32, f32),
+    bbox: (f32, f32, f32, f32),
+    pixel_bounds: (u32, u32, u32, u32),
+    image: ImageResult,
+    dpi: f32,
+    scale: f32,
+}
+
+struct PageGeometry {
+    left: f64,
+    lower: f64,
+    width: f64,
+    height: f64,
+    rotation: i32,
+    scale: f64,
+    min_x: f64,
+    min_y: f64,
+    max_x: f64,
+    max_y: f64,
+}
+
+impl PageGeometry {
+    fn new(crop_box: &nipdf::file::Rectangle, rotation: i32, scale: f64) -> PyResult<Self> {
+        let left = crop_box.left_x as f64;
+        let lower = crop_box.lower_y as f64;
+        let right = crop_box.right_x as f64;
+        let upper = crop_box.upper_y as f64;
+        let width = right - left;
+        let height = upper - lower;
+        if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+            return Err(PyRuntimeError::new_err("page has non-positive dimensions"));
+        }
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(PyRuntimeError::new_err(
+                "invalid rendering scale computed from dpi",
+            ));
+        }
+        let mut normalized_rotation = rotation % 360;
+        if normalized_rotation < 0 {
+            normalized_rotation += 360;
+        }
+        let mut geom = Self {
+            left,
+            lower,
+            width,
+            height,
+            rotation: normalized_rotation,
+            scale,
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 0.0,
+            max_y: 0.0,
+        };
+        let corners = [(left, lower), (right, lower), (left, upper), (right, upper)];
+        let mut min_x = f64::INFINITY;
+        let mut min_y = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+        for &(cx, cy) in &corners {
+            let (tx, ty) = geom.transform(cx, cy);
+            if tx < min_x {
+                min_x = tx;
+            }
+            if tx > max_x {
+                max_x = tx;
+            }
+            if ty < min_y {
+                min_y = ty;
+            }
+            if ty > max_y {
+                max_y = ty;
+            }
+        }
+        geom.min_x = min_x;
+        geom.min_y = min_y;
+        geom.max_x = max_x;
+        geom.max_y = max_y;
+        Ok(geom)
+    }
+
+    fn transform(&self, x: f64, y: f64) -> (f64, f64) {
+        let x1 = x - self.left;
+        let y1 = y - self.lower;
+        if self.rotation % 360 == 0 {
+            (self.scale * x1, (self.height - y1) * self.scale)
+        } else {
+            let theta = (self.rotation as f64).to_radians();
+            let cos_theta = theta.cos();
+            let sin_theta = theta.sin();
+            let x2 = self.scale * x1;
+            let y2 = -self.scale * y1 + self.height * self.scale;
+            let x3 = x2 - self.width * self.scale * 0.5;
+            let y3 = y2 - self.height * self.scale * 0.5;
+            let x4 = x3 * cos_theta - y3 * sin_theta;
+            let y4 = x3 * sin_theta + y3 * cos_theta;
+            (
+                x4 + self.height * self.scale * 0.5,
+                y4 + self.width * self.scale * 0.5,
+            )
+        }
+    }
+
+    fn to_pixels(&self, x: f64, y: f64) -> (f64, f64) {
+        let (tx, ty) = self.transform(x, y);
+        (tx - self.min_x, ty - self.min_y)
+    }
+}
+
 fn collect_positioned_images(
     ops: &[Op],
     resources: Option<&MaybeRef<Resources>>,
@@ -869,8 +997,17 @@ fn assign_captions_to_objects(
 fn encode_png(data: &[u8], width: u32, height: u32, color: ColorType) -> Result<Vec<u8>, PdfError> {
     let mut buffer = Vec::new();
     let mut encoder = Encoder::new(&mut buffer, width, height);
-    encoder.set_color(color);
-    encoder.set_depth(BitDepth::Eight);
+    match color {
+        ColorType::Grayscale | ColorType::Rgb | ColorType::Rgba => {
+            encoder.set_color(color);
+            encoder.set_depth(BitDepth::Eight);
+        }
+        _ => {
+            return Err(PdfError::Other {
+                msg: format!("unsupported PNG color type: {:?}", color),
+            });
+        }
+    }
     let mut writer = encoder
         .write_header()
         .map_err(|e| PdfError::Other { msg: e.to_string() })?;
@@ -1005,6 +1142,60 @@ fn positioned_images_to_pydicts(
     images
         .into_iter()
         .map(|image| positioned_image_to_pydict(py, image))
+        .collect()
+}
+
+fn region_image_to_pydict(py: Python<'_>, region: RegionImage) -> PyResult<Py<PyDict>> {
+    let RegionImage {
+        index,
+        page_index,
+        input_bbox,
+        bbox,
+        pixel_bounds,
+        image,
+        dpi,
+        scale,
+    } = region;
+    let ImageResult {
+        data,
+        width,
+        height,
+        format,
+    } = image;
+    let dict = PyDict::new(py);
+    dict.set_item("type", "region_image")?;
+    dict.set_item("index", index)?;
+    dict.set_item("page_index", page_index)?;
+    dict.set_item("x", bbox.0 as f64)?;
+    dict.set_item("y", bbox.1 as f64)?;
+    set_bbox(&dict, bbox)?;
+    dict.set_item("width", width)?;
+    dict.set_item("height", height)?;
+    dict.set_item("dpi", dpi as f64)?;
+    dict.set_item("scale", scale as f64)?;
+    dict.set_item("format", format)?;
+    dict.set_item("data", PyBytes::new(py, &data))?;
+    dict.set_item("pixel_left", pixel_bounds.0)?;
+    dict.set_item("pixel_top", pixel_bounds.1)?;
+    dict.set_item("pixel_right", pixel_bounds.2)?;
+    dict.set_item("pixel_bottom", pixel_bounds.3)?;
+    let input_tuple = PyTuple::new(
+        py,
+        [
+            input_bbox.0 as f64,
+            input_bbox.1 as f64,
+            input_bbox.2 as f64,
+            input_bbox.3 as f64,
+        ],
+    )?;
+    dict.set_item("input_rect", input_tuple)?;
+    Ok(dict.into())
+}
+
+fn region_images_to_pydicts(py: Python<'_>, images: Vec<RegionImage>) -> PyResult<Vec<Py<PyDict>>> {
+    images
+        .into_iter()
+        .map(|image| region_image_to_pydict(py, image))
         .collect()
 }
 
@@ -1199,7 +1390,7 @@ fn extract_text_with_coords(
 ) -> PyResult<Vec<Py<PyDict>>> {
     let pdf = open_pdf(path).map_err(pdf_err)?;
     let page = get_page(&pdf, page_index).map_err(pdf_err)?;
-    let page_ref: &Page = &page;
+    let page_ref: &PdfPage = &page;
     let resolver = pdf.resolver();
     let fonts = collect_fonts(page_ref, &resolver).map_err(pdf_err)?;
     let content = match &page_ref.contents {
@@ -1215,7 +1406,7 @@ fn extract_text_with_coords(
 fn extract_images(py: Python<'_>, path: &str, page_index: usize) -> PyResult<Vec<Py<PyDict>>> {
     let pdf = open_pdf(path).map_err(pdf_err)?;
     let page = get_page(&pdf, page_index).map_err(pdf_err)?;
-    let page_ref: &Page = &page;
+    let page_ref: &PdfPage = &page;
     let resolver = pdf.resolver();
     let content = match &page_ref.contents {
         Some(content) => content,
@@ -1228,10 +1419,165 @@ fn extract_images(py: Python<'_>, path: &str, page_index: usize) -> PyResult<Vec
 }
 
 #[pyfunction]
+#[pyo3(signature = (path, page_index, rectangles, dpi = 144.0))]
+fn extract_region_images(
+    py: Python<'_>,
+    path: &str,
+    page_index: usize,
+    rectangles: Vec<(f32, f32, f32, f32)>,
+    dpi: f32,
+) -> PyResult<Vec<Py<PyDict>>> {
+    if rectangles.is_empty() {
+        return Ok(vec![]);
+    }
+    if !dpi.is_finite() || dpi <= 0.0 {
+        return Err(PyRuntimeError::new_err(
+            "dpi must be a positive finite value",
+        ));
+    }
+
+    let document = open_nipdf(path)?;
+    let resolver = document.resolver().map_err(nipdf_obj_err)?;
+    let catalog = document.catalog(&resolver).map_err(nipdf_obj_err)?;
+    let pages = catalog.pages().map_err(nipdf_obj_err)?;
+    let page = pages.get(page_index).ok_or_else(|| {
+        PyRuntimeError::new_err(format!(
+            "page_index {} out of range ({} pages)",
+            page_index,
+            pages.len()
+        ))
+    })?;
+    let crop_box = page.crop_box().map_err(nipdf_obj_err)?;
+    let scale_factor = f64::from(dpi) / 72.0;
+    let geometry = PageGeometry::new(&crop_box, page.rotate(), scale_factor)?;
+
+    let render_builder = RenderOptionBuilder::default()
+        .zoom(scale_factor as f32)
+        .page_box(&crop_box, page.rotate());
+    let rendered = render_page(page, render_builder)
+        .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+    let image_width = rendered.width();
+    let image_height = rendered.height();
+    if image_width == 0 || image_height == 0 {
+        return Err(PyRuntimeError::new_err("rendered page has zero dimensions"));
+    }
+
+    let page_left = geometry.left;
+    let page_lower = geometry.lower;
+    let page_right = page_left + geometry.width;
+    let page_upper = page_lower + geometry.height;
+    let image_width_f = image_width as f64;
+    let image_height_f = image_height as f64;
+
+    let mut regions = Vec::with_capacity(rectangles.len());
+    for (index, &(x0, y0, x1, y1)) in rectangles.iter().enumerate() {
+        let canonical = (
+            f64::from(x0.min(x1)),
+            f64::from(y0.min(y1)),
+            f64::from(x0.max(x1)),
+            f64::from(y0.max(y1)),
+        );
+        let clamped = (
+            canonical.0.clamp(page_left, page_right),
+            canonical.1.clamp(page_lower, page_upper),
+            canonical.2.clamp(page_left, page_right),
+            canonical.3.clamp(page_lower, page_upper),
+        );
+        if clamped.0 >= clamped.2 || clamped.1 >= clamped.3 {
+            return Err(PyRuntimeError::new_err(format!(
+                "rectangle at index {} does not overlap the page bounds",
+                index
+            )));
+        }
+
+        let corners = [
+            (clamped.0, clamped.1),
+            (clamped.0, clamped.3),
+            (clamped.2, clamped.1),
+            (clamped.2, clamped.3),
+        ];
+        let mut min_px = f64::INFINITY;
+        let mut max_px = f64::NEG_INFINITY;
+        let mut min_py = f64::INFINITY;
+        let mut max_py = f64::NEG_INFINITY;
+        for &(cx, cy) in &corners {
+            let (px, py) = geometry.to_pixels(cx, cy);
+            if px < min_px {
+                min_px = px;
+            }
+            if px > max_px {
+                max_px = px;
+            }
+            if py < min_py {
+                min_py = py;
+            }
+            if py > max_py {
+                max_py = py;
+            }
+        }
+
+        let left_px_f = min_px.floor().max(0.0);
+        let right_px_f = max_px.ceil().min(image_width_f);
+        let top_px_f = min_py.floor().max(0.0);
+        let bottom_px_f = max_py.ceil().min(image_height_f);
+
+        let left_px = left_px_f as u32;
+        let mut right_px = right_px_f as u32;
+        let top_px = top_px_f as u32;
+        let mut bottom_px = bottom_px_f as u32;
+
+        if right_px <= left_px {
+            right_px = (right_px + 1).min(image_width);
+        }
+        if bottom_px <= top_px {
+            bottom_px = (bottom_px + 1).min(image_height);
+        }
+        if right_px <= left_px || bottom_px <= top_px {
+            return Err(PyRuntimeError::new_err(format!(
+                "rectangle at index {} produced an empty region after scaling",
+                index
+            )));
+        }
+
+        let crop_width = right_px - left_px;
+        let crop_height = bottom_px - top_px;
+        let cropped =
+            imageops::crop_imm(&rendered, left_px, top_px, crop_width, crop_height).to_image();
+        let width_px = cropped.width();
+        let height_px = cropped.height();
+        let raw = cropped.into_raw();
+        let png_data = encode_png(&raw, width_px, height_px, ColorType::Rgba).map_err(pdf_err)?;
+        let pixel_bounds = (left_px, top_px, right_px, bottom_px);
+        regions.push(RegionImage {
+            index,
+            page_index,
+            input_bbox: (x0, y0, x1, y1),
+            bbox: (
+                clamped.0 as f32,
+                clamped.1 as f32,
+                clamped.2 as f32,
+                clamped.3 as f32,
+            ),
+            pixel_bounds,
+            image: ImageResult {
+                data: png_data,
+                width: width_px,
+                height: height_px,
+                format: "png".into(),
+            },
+            dpi,
+            scale: scale_factor as f32,
+        });
+    }
+
+    region_images_to_pydicts(py, regions)
+}
+
+#[pyfunction]
 fn extract_paths(path: &str, page_index: usize) -> PyResult<Vec<(String, Vec<(f32, f32)>)>> {
     let pdf = open_pdf(path).map_err(pdf_err)?;
     let page = get_page(&pdf, page_index).map_err(pdf_err)?;
-    let page_ref: &Page = &page;
+    let page_ref: &PdfPage = &page;
     let resolver = pdf.resolver();
     let content = match &page_ref.contents {
         Some(content) => content,
@@ -1253,7 +1599,7 @@ fn extract_layouts(
 ) -> PyResult<Vec<Py<PyDict>>> {
     let pdf = open_pdf(path).map_err(pdf_err)?;
     let page = get_page(&pdf, page_index).map_err(pdf_err)?;
-    let page_ref: &Page = &page;
+    let page_ref: &PdfPage = &page;
     let resolver = pdf.resolver();
     let fonts = collect_fonts(page_ref, &resolver).map_err(pdf_err)?;
     let resources = page_ref.resources().ok();
@@ -1302,7 +1648,7 @@ fn extract_layouts(
 fn extract_page_content(py: Python<'_>, path: &str, page_index: usize) -> PyResult<Py<PyDict>> {
     let pdf = open_pdf(path).map_err(pdf_err)?;
     let page = get_page(&pdf, page_index).map_err(pdf_err)?;
-    let page_ref: &Page = &page;
+    let page_ref: &PdfPage = &page;
     let resolver = pdf.resolver();
     let fonts = collect_fonts(page_ref, &resolver).map_err(pdf_err)?;
     let resources = page_ref.resources().ok();
@@ -1416,6 +1762,7 @@ fn pdfmodule(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_page_count, m)?)?;
     m.add_function(wrap_pyfunction!(extract_text_with_coords, m)?)?;
     m.add_function(wrap_pyfunction!(extract_images, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_region_images, m)?)?;
     m.add_function(wrap_pyfunction!(extract_paths, m)?)?;
     m.add_function(wrap_pyfunction!(extract_layouts, m)?)?;
     m.add_function(wrap_pyfunction!(extract_page_content, m)?)?;
