@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use pdf::content::{Matrix, Op, Point, Rect, TextDrawAdjusted};
@@ -23,7 +24,7 @@ fn open_pdf(path: &str) -> Result<CachedFile<Vec<u8>>, PdfError> {
 }
 
 /// Lightweight representation of a text chunk extracted from a page.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TextBlock {
     text: String,
     x0: f32,
@@ -459,6 +460,154 @@ fn collect_text_blocks(ops: &[Op], fonts: &HashMap<String, ResolvedFont>) -> Vec
     blocks
 }
 
+type BBox = (f32, f32, f32, f32);
+
+fn bbox_from_block(block: &TextBlock) -> BBox {
+    (block.x0, block.y0, block.x1, block.y1)
+}
+
+fn bbox_union(a: BBox, b: BBox) -> BBox {
+    (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
+}
+
+fn axis_gap(a_min: f32, a_max: f32, b_min: f32, b_max: f32) -> f32 {
+    if a_max < b_min {
+        b_min - a_max
+    } else if b_max < a_min {
+        a_min - b_max
+    } else {
+        0.0
+    }
+}
+
+fn bbox_close(a: BBox, b: BBox, horizontal_margin: f32, vertical_margin: f32) -> bool {
+    let x_gap = axis_gap(a.0, a.2, b.0, b.2);
+    let y_gap = axis_gap(a.1, a.3, b.1, b.3);
+    x_gap <= horizontal_margin && y_gap <= vertical_margin
+}
+
+fn bbox_gaps(a: BBox, b: BBox) -> (f32, f32) {
+    (axis_gap(a.0, a.2, b.0, b.2), axis_gap(a.1, a.3, b.1, b.3))
+}
+
+fn cmp_f32(a: f32, b: f32) -> Ordering {
+    a.partial_cmp(&b).unwrap_or(Ordering::Equal)
+}
+
+#[derive(Clone)]
+struct TextLine {
+    center_y: f32,
+    text: String,
+}
+
+struct GroupedTextLayout {
+    bbox: BBox,
+    lines: Vec<TextLine>,
+}
+
+struct FinalTextLayout {
+    bbox: BBox,
+    lines: Vec<String>,
+    combined: String,
+    is_caption: bool,
+}
+
+impl FinalTextLayout {
+    fn width(&self) -> f32 {
+        self.bbox.2 - self.bbox.0
+    }
+
+    fn height(&self) -> f32 {
+        self.bbox.3 - self.bbox.1
+    }
+}
+
+fn looks_like_caption(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let trimmed = trimmed
+        .trim_start_matches(|c: char| c.is_whitespace() || c == '(' || c == '[')
+        .trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if matches!(trimmed.chars().next(), Some('図') | Some('表')) {
+        return true;
+    }
+    let lower = trimmed.to_lowercase();
+    lower.starts_with("fig ")
+        || lower.starts_with("fig.")
+        || lower.starts_with("fig(")
+        || lower.starts_with("figure")
+        || lower.starts_with("table")
+}
+
+fn build_text_layouts(blocks: &[TextBlock]) -> Vec<FinalTextLayout> {
+    let mut sorted: Vec<&TextBlock> = blocks.iter().collect();
+    sorted.sort_by(|a, b| {
+        let cmp_y = cmp_f32(b.y1, a.y1);
+        if cmp_y == Ordering::Equal {
+            cmp_f32(a.x0, b.x0)
+        } else {
+            cmp_y
+        }
+    });
+    let mut groups: Vec<GroupedTextLayout> = Vec::new();
+    for block in sorted {
+        let bbox = bbox_from_block(block);
+        let block_height = (block.y1 - block.y0).abs().max(1.0);
+        let horizontal_margin = block_height * 0.8 + 4.0;
+        let vertical_margin = block_height * 1.5 + 4.0;
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| bbox_close(group.bbox, bbox, horizontal_margin, vertical_margin))
+        {
+            group.bbox = bbox_union(group.bbox, bbox);
+            group.lines.push(TextLine {
+                center_y: (block.y0 + block.y1) / 2.0,
+                text: block.text.clone(),
+            });
+        } else {
+            groups.push(GroupedTextLayout {
+                bbox,
+                lines: vec![TextLine {
+                    center_y: (block.y0 + block.y1) / 2.0,
+                    text: block.text.clone(),
+                }],
+            });
+        }
+    }
+
+    let mut layouts: Vec<FinalTextLayout> = groups
+        .into_iter()
+        .map(|mut group| {
+            group.lines.sort_by(|a, b| cmp_f32(b.center_y, a.center_y));
+            let lines: Vec<String> = group.lines.into_iter().map(|line| line.text).collect();
+            let combined = lines.join("\n");
+            let first_line = lines.first().map(|s| s.as_str()).unwrap_or("");
+            let is_caption = looks_like_caption(first_line);
+            FinalTextLayout {
+                bbox: group.bbox,
+                lines,
+                combined,
+                is_caption,
+            }
+        })
+        .collect();
+
+    layouts.sort_by(|a, b| {
+        let cmp_y = cmp_f32(b.bbox.3, a.bbox.3);
+        if cmp_y == Ordering::Equal {
+            cmp_f32(a.bbox.0, b.bbox.0)
+        } else {
+            cmp_y
+        }
+    });
+    layouts
+}
+
 fn collect_paths(ops: &[Op]) -> Vec<(String, Vec<(f32, f32)>)> {
     let mut segments = Vec::new();
     let mut current_point: Option<Point> = None;
@@ -588,6 +737,133 @@ fn collect_positioned_images(
         }
     }
     Ok(images)
+}
+
+#[derive(Clone)]
+struct CaptionInfo {
+    text: String,
+    bbox: BBox,
+}
+
+struct ImageLayout {
+    name: String,
+    bbox: BBox,
+    captions: Vec<CaptionInfo>,
+}
+
+struct ObjectLayout {
+    bbox: BBox,
+    kinds: Vec<String>,
+    captions: Vec<CaptionInfo>,
+}
+
+const CAPTION_HORIZONTAL_MARGIN: f32 = 40.0;
+const CAPTION_VERTICAL_MARGIN: f32 = 80.0;
+const CAPTION_EPSILON: f32 = 1e-3;
+const OBJECT_MERGE_MARGIN: f32 = 4.0;
+
+fn build_image_layouts(images: &[PositionedImage]) -> Vec<ImageLayout> {
+    images
+        .iter()
+        .map(|image| ImageLayout {
+            name: image.name.clone(),
+            bbox: (image.x0, image.y0, image.x1, image.y1),
+            captions: Vec::new(),
+        })
+        .collect()
+}
+
+fn build_object_layouts(segments: &[(String, Vec<(f32, f32)>)]) -> Vec<ObjectLayout> {
+    let mut layouts: Vec<ObjectLayout> = Vec::new();
+    for (kind, points) in segments {
+        if let Some(bbox) = points_bbox(points) {
+            if let Some(layout) = layouts.iter_mut().find(|layout| {
+                bbox_close(layout.bbox, bbox, OBJECT_MERGE_MARGIN, OBJECT_MERGE_MARGIN)
+            }) {
+                layout.bbox = bbox_union(layout.bbox, bbox);
+                if !layout.kinds.iter().any(|existing| existing == kind) {
+                    layout.kinds.push(kind.clone());
+                }
+            } else {
+                layouts.push(ObjectLayout {
+                    bbox,
+                    kinds: vec![kind.clone()],
+                    captions: Vec::new(),
+                });
+            }
+        }
+    }
+    layouts
+}
+
+fn best_caption_index<T>(
+    layouts: &[T],
+    caption_bbox: BBox,
+    mut bbox_fn: impl FnMut(&T) -> BBox,
+) -> Option<usize> {
+    let mut best: Option<(usize, f32, f32)> = None;
+    for (idx, layout) in layouts.iter().enumerate() {
+        let bbox = bbox_fn(layout);
+        let (x_gap, y_gap) = bbox_gaps(bbox, caption_bbox);
+        if x_gap <= CAPTION_HORIZONTAL_MARGIN && y_gap <= CAPTION_VERTICAL_MARGIN {
+            match best {
+                Some((_, best_y, best_x))
+                    if y_gap > best_y + CAPTION_EPSILON
+                        || ((y_gap - best_y).abs() <= CAPTION_EPSILON
+                            && x_gap >= best_x - CAPTION_EPSILON) => {}
+                _ => {
+                    best = Some((idx, y_gap, x_gap));
+                }
+            }
+        }
+    }
+    best.map(|(idx, _, _)| idx)
+}
+
+fn assign_captions_to_images(
+    layouts: &mut [ImageLayout],
+    text_layouts: &[FinalTextLayout],
+    caption_indices: &[usize],
+    assigned: &mut [bool],
+) {
+    for &caption_idx in caption_indices {
+        if assigned.get(caption_idx).copied().unwrap_or(false) {
+            continue;
+        }
+        let caption = &text_layouts[caption_idx];
+        if let Some(best_idx) = best_caption_index(layouts, caption.bbox, |layout| layout.bbox) {
+            let layout = &mut layouts[best_idx];
+            layout.bbox = bbox_union(layout.bbox, caption.bbox);
+            layout.captions.push(CaptionInfo {
+                text: caption.combined.clone(),
+                bbox: caption.bbox,
+            });
+            assigned[caption_idx] = true;
+        }
+    }
+}
+
+fn assign_captions_to_objects(
+    layouts: &mut [ObjectLayout],
+    text_layouts: &[FinalTextLayout],
+    caption_indices: &[usize],
+    assigned: &mut [bool],
+) {
+    for &caption_idx in caption_indices {
+        if assigned.get(caption_idx).copied().unwrap_or(false) {
+            continue;
+        }
+        let caption = &text_layouts[caption_idx];
+        if let Some(best_idx) = best_caption_index(layouts, caption.bbox, |layout| layout.bbox) {
+            let layout = &mut layouts[best_idx];
+            layout.bbox = bbox_union(layout.bbox, caption.bbox);
+            layout.captions.push(CaptionInfo {
+                text: caption.combined.clone(),
+                bbox: caption.bbox,
+            });
+            assigned[caption_idx] = true;
+        }
+    }
 }
 
 fn encode_png(data: &[u8], width: u32, height: u32, color: ColorType) -> Result<Vec<u8>, PdfError> {
@@ -776,6 +1052,132 @@ fn path_segment_to_pydict(
     Ok(dict.into())
 }
 
+const DEFAULT_TEXT_LAYOUT_COLOR: (f32, f32, f32) = (0.12, 0.45, 0.85);
+const DEFAULT_IMAGE_LAYOUT_COLOR: (f32, f32, f32) = (0.23, 0.70, 0.35);
+const DEFAULT_OBJECT_LAYOUT_COLOR: (f32, f32, f32) = (0.86, 0.33, 0.42);
+const DEFAULT_CUSTOM_RECT_COLOR: (f32, f32, f32) = (0.95, 0.40, 0.05);
+
+struct LayoutColors {
+    text: (f32, f32, f32),
+    image: (f32, f32, f32),
+    object: (f32, f32, f32),
+}
+
+impl LayoutColors {
+    fn new(
+        text: Option<(f32, f32, f32)>,
+        image: Option<(f32, f32, f32)>,
+        object: Option<(f32, f32, f32)>,
+    ) -> Self {
+        Self {
+            text: text.unwrap_or(DEFAULT_TEXT_LAYOUT_COLOR),
+            image: image.unwrap_or(DEFAULT_IMAGE_LAYOUT_COLOR),
+            object: object.unwrap_or(DEFAULT_OBJECT_LAYOUT_COLOR),
+        }
+    }
+}
+
+fn color_to_tuple(color: (f32, f32, f32)) -> (f64, f64, f64) {
+    (color.0 as f64, color.1 as f64, color.2 as f64)
+}
+
+fn set_bbox(dict: &Bound<PyDict>, bbox: BBox) -> PyResult<()> {
+    dict.set_item("x0", bbox.0 as f64)?;
+    dict.set_item("y0", bbox.1 as f64)?;
+    dict.set_item("x1", bbox.2 as f64)?;
+    dict.set_item("y1", bbox.3 as f64)?;
+    Ok(())
+}
+
+fn captions_to_pydicts(py: Python<'_>, captions: &[CaptionInfo]) -> PyResult<Vec<Py<PyDict>>> {
+    let mut dicts = Vec::with_capacity(captions.len());
+    for caption in captions {
+        let dict = PyDict::new(py);
+        dict.set_item("type", "caption")?;
+        dict.set_item("text", caption.text.as_str())?;
+        dict.set_item("x", caption.bbox.0 as f64)?;
+        dict.set_item("y", caption.bbox.1 as f64)?;
+        set_bbox(&dict, caption.bbox)?;
+        dict.set_item("width", (caption.bbox.2 - caption.bbox.0) as f64)?;
+        dict.set_item("height", (caption.bbox.3 - caption.bbox.1) as f64)?;
+        dicts.push(dict.into());
+    }
+    Ok(dicts)
+}
+
+fn text_layouts_to_pydicts(
+    py: Python<'_>,
+    layouts: &[FinalTextLayout],
+    color: (f32, f32, f32),
+) -> PyResult<Vec<Py<PyDict>>> {
+    let mut dicts = Vec::with_capacity(layouts.len());
+    for layout in layouts {
+        let dict = PyDict::new(py);
+        dict.set_item("type", "text_layout")?;
+        dict.set_item("x", layout.bbox.0 as f64)?;
+        dict.set_item("y", layout.bbox.1 as f64)?;
+        set_bbox(&dict, layout.bbox)?;
+        dict.set_item("width", layout.width() as f64)?;
+        dict.set_item("height", layout.height() as f64)?;
+        dict.set_item("color", color_to_tuple(color))?;
+        dict.set_item("text", layout.combined.as_str())?;
+        let lines_list = PyList::new(py, &layout.lines)?;
+        dict.set_item("lines", lines_list)?;
+        dict.set_item("is_caption", layout.is_caption)?;
+        dicts.push(dict.into());
+    }
+    Ok(dicts)
+}
+
+fn image_layouts_to_pydicts(
+    py: Python<'_>,
+    layouts: &[ImageLayout],
+    color: (f32, f32, f32),
+) -> PyResult<Vec<Py<PyDict>>> {
+    let mut dicts = Vec::with_capacity(layouts.len());
+    for layout in layouts {
+        let dict = PyDict::new(py);
+        dict.set_item("type", "image_layout")?;
+        dict.set_item("name", layout.name.as_str())?;
+        dict.set_item("x", layout.bbox.0 as f64)?;
+        dict.set_item("y", layout.bbox.1 as f64)?;
+        set_bbox(&dict, layout.bbox)?;
+        dict.set_item("width", (layout.bbox.2 - layout.bbox.0) as f64)?;
+        dict.set_item("height", (layout.bbox.3 - layout.bbox.1) as f64)?;
+        dict.set_item("color", color_to_tuple(color))?;
+        let caption_dicts = captions_to_pydicts(py, &layout.captions)?;
+        let caption_list = PyList::new(py, &caption_dicts)?;
+        dict.set_item("captions", caption_list)?;
+        dicts.push(dict.into());
+    }
+    Ok(dicts)
+}
+
+fn object_layouts_to_pydicts(
+    py: Python<'_>,
+    layouts: &[ObjectLayout],
+    color: (f32, f32, f32),
+) -> PyResult<Vec<Py<PyDict>>> {
+    let mut dicts = Vec::with_capacity(layouts.len());
+    for layout in layouts {
+        let dict = PyDict::new(py);
+        dict.set_item("type", "object_layout")?;
+        dict.set_item("x", layout.bbox.0 as f64)?;
+        dict.set_item("y", layout.bbox.1 as f64)?;
+        set_bbox(&dict, layout.bbox)?;
+        dict.set_item("width", (layout.bbox.2 - layout.bbox.0) as f64)?;
+        dict.set_item("height", (layout.bbox.3 - layout.bbox.1) as f64)?;
+        dict.set_item("color", color_to_tuple(color))?;
+        let kinds_list = PyList::new(py, &layout.kinds)?;
+        dict.set_item("kinds", kinds_list)?;
+        let caption_dicts = captions_to_pydicts(py, &layout.captions)?;
+        let caption_list = PyList::new(py, &caption_dicts)?;
+        dict.set_item("captions", caption_list)?;
+        dicts.push(dict.into());
+    }
+    Ok(dicts)
+}
+
 #[pyfunction]
 fn get_page_count(path: &str) -> PyResult<usize> {
     let pdf = open_pdf(path).map_err(pdf_err)?;
@@ -840,6 +1242,63 @@ fn extract_paths(path: &str, page_index: usize) -> PyResult<Vec<(String, Vec<(f3
 }
 
 #[pyfunction]
+#[pyo3(signature = (path, page_index, text_color = None, image_color = None, object_color = None))]
+fn extract_layouts(
+    py: Python<'_>,
+    path: &str,
+    page_index: usize,
+    text_color: Option<(f32, f32, f32)>,
+    image_color: Option<(f32, f32, f32)>,
+    object_color: Option<(f32, f32, f32)>,
+) -> PyResult<Vec<Py<PyDict>>> {
+    let pdf = open_pdf(path).map_err(pdf_err)?;
+    let page = get_page(&pdf, page_index).map_err(pdf_err)?;
+    let page_ref: &Page = &page;
+    let resolver = pdf.resolver();
+    let fonts = collect_fonts(page_ref, &resolver).map_err(pdf_err)?;
+    let resources = page_ref.resources().ok();
+    let content = match &page_ref.contents {
+        Some(content) => content,
+        None => return Ok(vec![]),
+    };
+    let operations = content.operations(&resolver).map_err(pdf_err)?;
+    let text_blocks = collect_text_blocks(&operations, &fonts);
+    let text_layouts = build_text_layouts(&text_blocks);
+    let caption_indices: Vec<usize> = text_layouts
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, layout)| if layout.is_caption { Some(idx) } else { None })
+        .collect();
+    let mut caption_assigned = vec![false; text_layouts.len()];
+    let images = collect_positioned_images(&operations, resources, &resolver).map_err(pdf_err)?;
+    let mut image_layouts = build_image_layouts(&images);
+    let path_segments = collect_paths(&operations);
+    let mut object_layouts = build_object_layouts(&path_segments);
+    assign_captions_to_images(
+        &mut image_layouts,
+        &text_layouts,
+        &caption_indices,
+        &mut caption_assigned,
+    );
+    assign_captions_to_objects(
+        &mut object_layouts,
+        &text_layouts,
+        &caption_indices,
+        &mut caption_assigned,
+    );
+    let colors = LayoutColors::new(text_color, image_color, object_color);
+
+    let mut layouts = text_layouts_to_pydicts(py, &text_layouts, colors.text)?;
+    layouts.extend(image_layouts_to_pydicts(py, &image_layouts, colors.image)?);
+    layouts.extend(object_layouts_to_pydicts(
+        py,
+        &object_layouts,
+        colors.object,
+    )?);
+    Ok(layouts)
+}
+
+#[pyfunction]
 fn extract_page_content(py: Python<'_>, path: &str, page_index: usize) -> PyResult<Py<PyDict>> {
     let pdf = open_pdf(path).map_err(pdf_err)?;
     let page = get_page(&pdf, page_index).map_err(pdf_err)?;
@@ -855,24 +1314,57 @@ fn extract_page_content(py: Python<'_>, path: &str, page_index: usize) -> PyResu
             page_dict.set_item("text", PyList::empty(py))?;
             page_dict.set_item("images", PyList::empty(py))?;
             page_dict.set_item("objects", PyList::empty(py))?;
+            page_dict.set_item("layouts", PyList::empty(py))?;
             page_dict.set_item("items", PyList::empty(py))?;
             return Ok(page_dict.into());
         }
     };
     let operations = content.operations(&resolver).map_err(pdf_err)?;
-    let text_entries = text_blocks_to_pydicts(py, collect_text_blocks(&operations, &fonts))?;
-    let image_entries = positioned_images_to_pydicts(
+    let text_blocks = collect_text_blocks(&operations, &fonts);
+    let text_layouts = build_text_layouts(&text_blocks);
+    let caption_indices: Vec<usize> = text_layouts
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, layout)| if layout.is_caption { Some(idx) } else { None })
+        .collect();
+    let mut caption_assigned = vec![false; text_layouts.len()];
+    let images = collect_positioned_images(&operations, resources, &resolver).map_err(pdf_err)?;
+    let mut image_layouts = build_image_layouts(&images);
+    let path_segments = collect_paths(&operations);
+    let mut object_layouts = build_object_layouts(&path_segments);
+    assign_captions_to_images(
+        &mut image_layouts,
+        &text_layouts,
+        &caption_indices,
+        &mut caption_assigned,
+    );
+    assign_captions_to_objects(
+        &mut object_layouts,
+        &text_layouts,
+        &caption_indices,
+        &mut caption_assigned,
+    );
+
+    let text_entries = text_blocks_to_pydicts(py, text_blocks.clone())?;
+    let image_entries = positioned_images_to_pydicts(py, images)?;
+    let mut object_entries = Vec::with_capacity(path_segments.len());
+    for (kind, points) in &path_segments {
+        object_entries.push(path_segment_to_pydict(py, kind.clone(), points.clone())?);
+    }
+
+    let colors = LayoutColors::new(None, None, None);
+    let mut layout_entries = text_layouts_to_pydicts(py, &text_layouts, colors.text)?;
+    layout_entries.extend(image_layouts_to_pydicts(py, &image_layouts, colors.image)?);
+    layout_entries.extend(object_layouts_to_pydicts(
         py,
-        collect_positioned_images(&operations, resources, &resolver).map_err(pdf_err)?,
-    )?;
-    let object_entries = collect_paths(&operations)
-        .into_iter()
-        .map(|(kind, points)| path_segment_to_pydict(py, kind, points))
-        .collect::<PyResult<Vec<_>>>()?;
+        &object_layouts,
+        colors.object,
+    )?);
 
     let text_list = PyList::new(py, &text_entries)?;
     let image_list = PyList::new(py, &image_entries)?;
     let object_list = PyList::new(py, &object_entries)?;
+    let layout_list = PyList::new(py, &layout_entries)?;
 
     let mut all_items: Vec<Py<PyAny>> = Vec::new();
     for entry in &text_entries {
@@ -891,8 +1383,32 @@ fn extract_page_content(py: Python<'_>, path: &str, page_index: usize) -> PyResu
     page_dict.set_item("text", text_list)?;
     page_dict.set_item("images", image_list)?;
     page_dict.set_item("objects", object_list)?;
+    page_dict.set_item("layouts", layout_list)?;
     page_dict.set_item("items", items_list)?;
     Ok(page_dict.into())
+}
+
+#[pyfunction]
+#[pyo3(signature = (x0, y0, x1, y1, color = None))]
+fn make_rectangle_outline(
+    py: Python<'_>,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    color: Option<(f32, f32, f32)>,
+) -> PyResult<Py<PyDict>> {
+    let bbox = (x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1));
+    let color = color.unwrap_or(DEFAULT_CUSTOM_RECT_COLOR);
+    let dict = PyDict::new(py);
+    dict.set_item("type", "rectangle_outline")?;
+    dict.set_item("x", bbox.0 as f64)?;
+    dict.set_item("y", bbox.1 as f64)?;
+    set_bbox(&dict, bbox)?;
+    dict.set_item("width", (bbox.2 - bbox.0) as f64)?;
+    dict.set_item("height", (bbox.3 - bbox.1) as f64)?;
+    dict.set_item("color", color_to_tuple(color))?;
+    Ok(dict.into())
 }
 
 #[pymodule]
@@ -901,6 +1417,8 @@ fn pdfmodule(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_text_with_coords, m)?)?;
     m.add_function(wrap_pyfunction!(extract_images, m)?)?;
     m.add_function(wrap_pyfunction!(extract_paths, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_layouts, m)?)?;
     m.add_function(wrap_pyfunction!(extract_page_content, m)?)?;
+    m.add_function(wrap_pyfunction!(make_rectangle_outline, m)?)?;
     Ok(())
 }
