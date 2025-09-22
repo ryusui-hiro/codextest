@@ -10,6 +10,7 @@ use pdf::primitive::PdfString;
 use png::{BitDepth, ColorType, Encoder};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyDict};
 
 /// Convert a [`PdfError`] into a Python runtime error.
 fn pdf_err(err: PdfError) -> PyErr {
@@ -245,6 +246,45 @@ fn apply_matrix(matrix: &Matrix, point: (f32, f32)) -> (f32, f32) {
     )
 }
 
+fn concat_matrix(current: &Matrix, next: &Matrix) -> Matrix {
+    Matrix {
+        a: current.a * next.a + current.b * next.c,
+        b: current.a * next.b + current.b * next.d,
+        c: current.c * next.a + current.d * next.c,
+        d: current.c * next.b + current.d * next.d,
+        e: current.a * next.e + current.c * next.f + current.e,
+        f: current.b * next.e + current.d * next.f + current.f,
+    }
+}
+
+fn unit_square_bounds(matrix: &Matrix) -> (f32, f32, f32, f32) {
+    let corners = [
+        apply_matrix(matrix, (0.0, 0.0)),
+        apply_matrix(matrix, (1.0, 0.0)),
+        apply_matrix(matrix, (0.0, 1.0)),
+        apply_matrix(matrix, (1.0, 1.0)),
+    ];
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for (x, y) in corners {
+        if x < min_x {
+            min_x = x;
+        }
+        if x > max_x {
+            max_x = x;
+        }
+        if y < min_y {
+            min_y = y;
+        }
+        if y > max_y {
+            max_y = y;
+        }
+    }
+    (min_x, min_y, max_x, max_y)
+}
+
 fn collect_fonts(
     page: &Page,
     resolver: &impl Resolve,
@@ -377,6 +417,15 @@ struct ImageResult {
     format: String,
 }
 
+struct PositionedImage {
+    name: String,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    image: ImageResult,
+}
+
 fn encode_png(data: &[u8], width: u32, height: u32, color: ColorType) -> Result<Vec<u8>, PdfError> {
     let mut buffer = Vec::new();
     let mut encoder = Encoder::new(&mut buffer, width, height);
@@ -502,29 +551,96 @@ fn extract_text_with_coords(path: &str, page_index: usize) -> PyResult<Vec<(Stri
 }
 
 #[pyfunction]
-fn extract_images(path: &str, page_index: usize) -> PyResult<Vec<(Vec<u8>, u32, u32, String)>> {
+fn extract_images(py: Python<'_>, path: &str, page_index: usize) -> PyResult<Vec<Py<PyDict>>> {
     let pdf = open_pdf(path).map_err(pdf_err)?;
     let page = get_page(&pdf, page_index).map_err(pdf_err)?;
     let page_ref: &Page = &page;
     let resolver = pdf.resolver();
-    let mut results = Vec::new();
-    if let Ok(resources) = page_ref.resources() {
-        for xobject_ref in resources.xobjects.values() {
-            let xobject = resolver.get(*xobject_ref).map_err(pdf_err)?;
-            if let XObject::Image(image) = &*xobject {
-                match extract_image(image, &resolver) {
-                    Ok(image_data) => results.push((
-                        image_data.data,
-                        image_data.width,
-                        image_data.height,
-                        image_data.format,
-                    )),
-                    Err(err) => return Err(pdf_err(err)),
+    let content = match &page_ref.contents {
+        Some(content) => content,
+        None => return Ok(vec![]),
+    };
+    let operations = content.operations(&resolver).map_err(pdf_err)?;
+    let resources = page_ref.resources().ok();
+    let mut ctm = Matrix::default();
+    let mut stack: Vec<Matrix> = Vec::new();
+    let mut images: Vec<PositionedImage> = Vec::new();
+    let mut inline_index = 0usize;
+    for op in operations {
+        match op {
+            Op::Save => stack.push(ctm),
+            Op::Restore => ctm = stack.pop().unwrap_or_default(),
+            Op::Transform { matrix } => ctm = concat_matrix(&ctm, &matrix),
+            Op::XObject { name } => {
+                if let Some(res) = resources {
+                    if let Some(xobject_ref) = res.xobjects.get(&name) {
+                        let xobject = resolver.get(*xobject_ref).map_err(pdf_err)?;
+                        if let XObject::Image(image) = &*xobject {
+                            match extract_image(image, &resolver) {
+                                Ok(image_data) => {
+                                    let (x0, y0, x1, y1) = unit_square_bounds(&ctm);
+                                    images.push(PositionedImage {
+                                        name: name.as_str().to_owned(),
+                                        x0,
+                                        y0,
+                                        x1,
+                                        y1,
+                                        image: image_data,
+                                    });
+                                }
+                                Err(err) => return Err(pdf_err(err)),
+                            }
+                        }
+                    }
                 }
             }
+            Op::InlineImage { image } => match extract_image(&image, &resolver) {
+                Ok(image_data) => {
+                    inline_index += 1;
+                    let (x0, y0, x1, y1) = unit_square_bounds(&ctm);
+                    images.push(PositionedImage {
+                        name: format!("inline_{}", inline_index),
+                        x0,
+                        y0,
+                        x1,
+                        y1,
+                        image: image_data,
+                    });
+                }
+                Err(err) => return Err(pdf_err(err)),
+            },
+            _ => {}
         }
     }
-    Ok(results)
+    let mut output = Vec::with_capacity(images.len());
+    for positioned in images {
+        let PositionedImage {
+            name,
+            x0,
+            y0,
+            x1,
+            y1,
+            image,
+        } = positioned;
+        let ImageResult {
+            data,
+            width,
+            height,
+            format,
+        } = image;
+        let dict = PyDict::new(py);
+        dict.set_item("name", name)?;
+        dict.set_item("x0", x0 as f64)?;
+        dict.set_item("y0", y0 as f64)?;
+        dict.set_item("x1", x1 as f64)?;
+        dict.set_item("y1", y1 as f64)?;
+        dict.set_item("width", width)?;
+        dict.set_item("height", height)?;
+        dict.set_item("format", format)?;
+        dict.set_item("data", PyBytes::new(py, &data))?;
+        output.push(dict.into());
+    }
+    Ok(output)
 }
 
 #[pyfunction]
