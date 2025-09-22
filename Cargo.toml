@@ -12,4 +12,5 @@ pdf = "0.9.0"
 png = "0.18.0"
 pyo3 = { version = "0.26.0", features = ["extension-module"] }
 image = "0.25.1"
-pdfium-render = { version = "0.8.35", default-features = false, features = ["pdfium_latest", "thread_safe", "image"] }
+nipdf = "0.1.1"
+nipdf-render = "0.1.1"

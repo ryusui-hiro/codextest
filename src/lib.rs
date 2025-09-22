@@ -1,36 +1,31 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::fs;
 
+use nipdf::ObjectValueError;
+use nipdf::file::File as NipdfFile;
+use nipdf_render::{RenderOptionBuilder, render_page};
 use pdf::content::{Matrix, Op, Point, Rect, TextDrawAdjusted};
 use pdf::error::PdfError;
 use pdf::file::{CachedFile, FileOptions};
 use pdf::font::{Font, FontData, FontDescriptor, ToUnicodeMap, Widths};
 use pdf::object::Resolve;
-use pdf::object::{ColorSpace, ImageXObject, MaybeRef, Page, Resources, XObject};
+use pdf::object::{ColorSpace, ImageXObject, MaybeRef, Page as PdfPage, Resources, XObject};
 use pdf::primitive::PdfString;
-use pdfium_render::prelude::{PdfRenderConfig, Pdfium, PdfiumError};
 use png::{BitDepth, ColorType, Encoder};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
+
+use image::imageops;
 
 /// Convert a [`PdfError`] into a Python runtime error.
 fn pdf_err(err: PdfError) -> PyErr {
     PyRuntimeError::new_err(err.to_string())
 }
 
-fn pdfium_err(err: PdfiumError) -> PyErr {
-    match err {
-        PdfiumError::LoadLibraryError(inner) => PyRuntimeError::new_err(format!(
-            "Failed to load Pdfium library: {}. Place a compatible Pdfium shared library in the working directory or install it system-wide.",
-            inner
-        )),
-        PdfiumError::LoadLibraryFunctionNameError(name) => PyRuntimeError::new_err(format!(
-            "Failed to resolve Pdfium symbol '{}'. Ensure the Pdfium library matches the crate configuration.",
-            name
-        )),
-        other => PyRuntimeError::new_err(other.to_string()),
-    }
+fn nipdf_obj_err(err: ObjectValueError) -> PyErr {
+    PyRuntimeError::new_err(err.to_string())
 }
 
 /// Open a PDF file using the `pdf` crate with the default cached options.
@@ -38,10 +33,11 @@ fn open_pdf(path: &str) -> Result<CachedFile<Vec<u8>>, PdfError> {
     FileOptions::cached().open(path)
 }
 
-fn load_pdfium() -> Result<Pdfium, PdfiumError> {
-    Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./"))
-        .or_else(|_| Pdfium::bind_to_system_library())
-        .map(Pdfium::new)
+fn open_nipdf(path: &str) -> PyResult<NipdfFile> {
+    let data = fs::read(path).map_err(|err| {
+        PyRuntimeError::new_err(format!("failed to read PDF '{}': {}", path, err))
+    })?;
+    NipdfFile::parse(data, "").map_err(nipdf_obj_err)
 }
 
 /// Lightweight representation of a text chunk extracted from a page.
@@ -394,7 +390,7 @@ fn unit_square_bounds(matrix: &Matrix) -> (f32, f32, f32, f32) {
 }
 
 fn collect_fonts(
-    page: &Page,
+    page: &PdfPage,
     resolver: &impl Resolve,
 ) -> Result<HashMap<String, ResolvedFont>, PdfError> {
     let mut fonts = HashMap::new();
@@ -717,6 +713,106 @@ struct RegionImage {
     image: ImageResult,
     dpi: f32,
     scale: f32,
+}
+
+struct PageGeometry {
+    left: f64,
+    lower: f64,
+    width: f64,
+    height: f64,
+    rotation: i32,
+    scale: f64,
+    min_x: f64,
+    min_y: f64,
+    max_x: f64,
+    max_y: f64,
+}
+
+impl PageGeometry {
+    fn new(crop_box: &nipdf::file::Rectangle, rotation: i32, scale: f64) -> PyResult<Self> {
+        let left = crop_box.left_x as f64;
+        let lower = crop_box.lower_y as f64;
+        let right = crop_box.right_x as f64;
+        let upper = crop_box.upper_y as f64;
+        let width = right - left;
+        let height = upper - lower;
+        if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+            return Err(PyRuntimeError::new_err("page has non-positive dimensions"));
+        }
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(PyRuntimeError::new_err(
+                "invalid rendering scale computed from dpi",
+            ));
+        }
+        let mut normalized_rotation = rotation % 360;
+        if normalized_rotation < 0 {
+            normalized_rotation += 360;
+        }
+        let mut geom = Self {
+            left,
+            lower,
+            width,
+            height,
+            rotation: normalized_rotation,
+            scale,
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 0.0,
+            max_y: 0.0,
+        };
+        let corners = [(left, lower), (right, lower), (left, upper), (right, upper)];
+        let mut min_x = f64::INFINITY;
+        let mut min_y = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+        for &(cx, cy) in &corners {
+            let (tx, ty) = geom.transform(cx, cy);
+            if tx < min_x {
+                min_x = tx;
+            }
+            if tx > max_x {
+                max_x = tx;
+            }
+            if ty < min_y {
+                min_y = ty;
+            }
+            if ty > max_y {
+                max_y = ty;
+            }
+        }
+        geom.min_x = min_x;
+        geom.min_y = min_y;
+        geom.max_x = max_x;
+        geom.max_y = max_y;
+        Ok(geom)
+    }
+
+    fn transform(&self, x: f64, y: f64) -> (f64, f64) {
+        let x1 = x - self.left;
+        let y1 = y - self.lower;
+        if self.rotation % 360 == 0 {
+            (self.scale * x1, (self.height - y1) * self.scale)
+        } else {
+            let theta = (self.rotation as f64).to_radians();
+            let cos_theta = theta.cos();
+            let sin_theta = theta.sin();
+            let x2 = self.scale * x1;
+            let y2 = -self.scale * y1 + self.height * self.scale;
+            let x3 = x2 - self.width * self.scale * 0.5;
+            let y3 = y2 - self.height * self.scale * 0.5;
+            let x4 = x3 * cos_theta - y3 * sin_theta;
+            let y4 = x3 * sin_theta + y3 * cos_theta;
+            (
+                x4 + self.height * self.scale * 0.5,
+                y4 + self.width * self.scale * 0.5,
+            )
+        }
+    }
+
+    fn to_pixels(&self, x: f64, y: f64) -> (f64, f64) {
+        let (tx, ty) = self.transform(x, y);
+        (tx - self.min_x, ty - self.min_y)
+    }
 }
 
 fn collect_positioned_images(
@@ -1294,7 +1390,7 @@ fn extract_text_with_coords(
 ) -> PyResult<Vec<Py<PyDict>>> {
     let pdf = open_pdf(path).map_err(pdf_err)?;
     let page = get_page(&pdf, page_index).map_err(pdf_err)?;
-    let page_ref: &Page = &page;
+    let page_ref: &PdfPage = &page;
     let resolver = pdf.resolver();
     let fonts = collect_fonts(page_ref, &resolver).map_err(pdf_err)?;
     let content = match &page_ref.contents {
@@ -1310,7 +1406,7 @@ fn extract_text_with_coords(
 fn extract_images(py: Python<'_>, path: &str, page_index: usize) -> PyResult<Vec<Py<PyDict>>> {
     let pdf = open_pdf(path).map_err(pdf_err)?;
     let page = get_page(&pdf, page_index).map_err(pdf_err)?;
-    let page_ref: &Page = &page;
+    let page_ref: &PdfPage = &page;
     let resolver = pdf.resolver();
     let content = match &page_ref.contents {
         Some(content) => content,
@@ -1340,57 +1436,52 @@ fn extract_region_images(
         ));
     }
 
-    let pdfium = load_pdfium().map_err(pdfium_err)?;
-    let document = pdfium.load_pdf_from_file(path, None).map_err(pdfium_err)?;
-    let page_index_u16 = u16::try_from(page_index).map_err(|_| {
-        PyRuntimeError::new_err("page_index exceeds Pdfium limits (must be <= 65535)")
+    let document = open_nipdf(path)?;
+    let resolver = document.resolver().map_err(nipdf_obj_err)?;
+    let catalog = document.catalog(&resolver).map_err(nipdf_obj_err)?;
+    let pages = catalog.pages().map_err(nipdf_obj_err)?;
+    let page = pages.get(page_index).ok_or_else(|| {
+        PyRuntimeError::new_err(format!(
+            "page_index {} out of range ({} pages)",
+            page_index,
+            pages.len()
+        ))
     })?;
-    let page = document.pages().get(page_index_u16).map_err(pdfium_err)?;
-    let page_width = page.width().value;
-    let page_height = page.height().value;
-    if !page_width.is_finite()
-        || !page_height.is_finite()
-        || page_width <= 0.0
-        || page_height <= 0.0
-    {
-        return Err(PyRuntimeError::new_err("page has non-positive dimensions"));
-    }
+    let crop_box = page.crop_box().map_err(nipdf_obj_err)?;
+    let scale_factor = f64::from(dpi) / 72.0;
+    let geometry = PageGeometry::new(&crop_box, page.rotate(), scale_factor)?;
 
-    let scale_factor = dpi / 72.0;
-    if !scale_factor.is_finite() || scale_factor <= 0.0 {
-        return Err(PyRuntimeError::new_err(
-            "invalid rendering scale computed from dpi",
-        ));
-    }
-
-    let render_config = PdfRenderConfig::new().scale_page_by_factor(scale_factor);
-    let bitmap = page
-        .render_with_config(&render_config)
-        .map_err(pdfium_err)?;
-    let rendered = bitmap.as_image();
+    let render_builder = RenderOptionBuilder::default()
+        .zoom(scale_factor as f32)
+        .page_box(&crop_box, page.rotate());
+    let rendered = render_page(page, render_builder)
+        .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
     let image_width = rendered.width();
     let image_height = rendered.height();
     if image_width == 0 || image_height == 0 {
         return Err(PyRuntimeError::new_err("rendered page has zero dimensions"));
     }
 
-    let scale_x = image_width as f32 / page_width;
-    let scale_y = image_height as f32 / page_height;
-    if !scale_x.is_finite() || !scale_y.is_finite() || scale_x <= 0.0 || scale_y <= 0.0 {
-        return Err(PyRuntimeError::new_err("unable to compute rendering scale"));
-    }
+    let page_left = geometry.left;
+    let page_lower = geometry.lower;
+    let page_right = page_left + geometry.width;
+    let page_upper = page_lower + geometry.height;
+    let image_width_f = image_width as f64;
+    let image_height_f = image_height as f64;
 
     let mut regions = Vec::with_capacity(rectangles.len());
-    let page_height_f = page_height;
-    let image_width_f = image_width as f32;
-    let image_height_f = image_height as f32;
     for (index, &(x0, y0, x1, y1)) in rectangles.iter().enumerate() {
-        let canonical = (x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1));
+        let canonical = (
+            f64::from(x0.min(x1)),
+            f64::from(y0.min(y1)),
+            f64::from(x0.max(x1)),
+            f64::from(y0.max(y1)),
+        );
         let clamped = (
-            canonical.0.clamp(0.0, page_width),
-            canonical.1.clamp(0.0, page_height),
-            canonical.2.clamp(0.0, page_width),
-            canonical.3.clamp(0.0, page_height),
+            canonical.0.clamp(page_left, page_right),
+            canonical.1.clamp(page_lower, page_upper),
+            canonical.2.clamp(page_left, page_right),
+            canonical.3.clamp(page_lower, page_upper),
         );
         if clamped.0 >= clamped.2 || clamped.1 >= clamped.3 {
             return Err(PyRuntimeError::new_err(format!(
@@ -1399,21 +1490,47 @@ fn extract_region_images(
             )));
         }
 
-        let left_f = (clamped.0 * scale_x).floor();
-        let right_f = (clamped.2 * scale_x).ceil();
-        let top_f = ((page_height_f - clamped.3) * scale_y).floor();
-        let bottom_f = ((page_height_f - clamped.1) * scale_y).ceil();
+        let corners = [
+            (clamped.0, clamped.1),
+            (clamped.0, clamped.3),
+            (clamped.2, clamped.1),
+            (clamped.2, clamped.3),
+        ];
+        let mut min_px = f64::INFINITY;
+        let mut max_px = f64::NEG_INFINITY;
+        let mut min_py = f64::INFINITY;
+        let mut max_py = f64::NEG_INFINITY;
+        for &(cx, cy) in &corners {
+            let (px, py) = geometry.to_pixels(cx, cy);
+            if px < min_px {
+                min_px = px;
+            }
+            if px > max_px {
+                max_px = px;
+            }
+            if py < min_py {
+                min_py = py;
+            }
+            if py > max_py {
+                max_py = py;
+            }
+        }
 
-        let left_px = left_f.clamp(0.0, image_width_f) as u32;
-        let mut right_px = right_f.clamp(0.0, image_width_f) as u32;
-        let top_px = top_f.clamp(0.0, image_height_f) as u32;
-        let mut bottom_px = bottom_f.clamp(0.0, image_height_f) as u32;
+        let left_px_f = min_px.floor().max(0.0);
+        let right_px_f = max_px.ceil().min(image_width_f);
+        let top_px_f = min_py.floor().max(0.0);
+        let bottom_px_f = max_py.ceil().min(image_height_f);
+
+        let left_px = left_px_f as u32;
+        let mut right_px = right_px_f as u32;
+        let top_px = top_px_f as u32;
+        let mut bottom_px = bottom_px_f as u32;
 
         if right_px <= left_px {
-            right_px = right_px.saturating_add(1).min(image_width);
+            right_px = (right_px + 1).min(image_width);
         }
         if bottom_px <= top_px {
-            bottom_px = bottom_px.saturating_add(1).min(image_height);
+            bottom_px = (bottom_px + 1).min(image_height);
         }
         if right_px <= left_px || bottom_px <= top_px {
             return Err(PyRuntimeError::new_err(format!(
@@ -1424,18 +1541,23 @@ fn extract_region_images(
 
         let crop_width = right_px - left_px;
         let crop_height = bottom_px - top_px;
-        let cropped = rendered.crop_imm(left_px, top_px, crop_width, crop_height);
-        let rgba = cropped.to_rgba8();
-        let width_px = rgba.width();
-        let height_px = rgba.height();
-        let raw = rgba.into_raw();
+        let cropped =
+            imageops::crop_imm(&rendered, left_px, top_px, crop_width, crop_height).to_image();
+        let width_px = cropped.width();
+        let height_px = cropped.height();
+        let raw = cropped.into_raw();
         let png_data = encode_png(&raw, width_px, height_px, ColorType::Rgba).map_err(pdf_err)?;
-        let pixel_bounds = (left_px, top_px, left_px + crop_width, top_px + crop_height);
+        let pixel_bounds = (left_px, top_px, right_px, bottom_px);
         regions.push(RegionImage {
             index,
             page_index,
             input_bbox: (x0, y0, x1, y1),
-            bbox: clamped,
+            bbox: (
+                clamped.0 as f32,
+                clamped.1 as f32,
+                clamped.2 as f32,
+                clamped.3 as f32,
+            ),
             pixel_bounds,
             image: ImageResult {
                 data: png_data,
@@ -1444,7 +1566,7 @@ fn extract_region_images(
                 format: "png".into(),
             },
             dpi,
-            scale: scale_factor,
+            scale: scale_factor as f32,
         });
     }
 
@@ -1455,7 +1577,7 @@ fn extract_region_images(
 fn extract_paths(path: &str, page_index: usize) -> PyResult<Vec<(String, Vec<(f32, f32)>)>> {
     let pdf = open_pdf(path).map_err(pdf_err)?;
     let page = get_page(&pdf, page_index).map_err(pdf_err)?;
-    let page_ref: &Page = &page;
+    let page_ref: &PdfPage = &page;
     let resolver = pdf.resolver();
     let content = match &page_ref.contents {
         Some(content) => content,
@@ -1477,7 +1599,7 @@ fn extract_layouts(
 ) -> PyResult<Vec<Py<PyDict>>> {
     let pdf = open_pdf(path).map_err(pdf_err)?;
     let page = get_page(&pdf, page_index).map_err(pdf_err)?;
-    let page_ref: &Page = &page;
+    let page_ref: &PdfPage = &page;
     let resolver = pdf.resolver();
     let fonts = collect_fonts(page_ref, &resolver).map_err(pdf_err)?;
     let resources = page_ref.resources().ok();
@@ -1526,7 +1648,7 @@ fn extract_layouts(
 fn extract_page_content(py: Python<'_>, path: &str, page_index: usize) -> PyResult<Py<PyDict>> {
     let pdf = open_pdf(path).map_err(pdf_err)?;
     let page = get_page(&pdf, page_index).map_err(pdf_err)?;
-    let page_ref: &Page = &page;
+    let page_ref: &PdfPage = &page;
     let resolver = pdf.resolver();
     let fonts = collect_fonts(page_ref, &resolver).map_err(pdf_err)?;
     let resources = page_ref.resources().ok();
