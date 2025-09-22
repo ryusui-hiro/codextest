@@ -1,0 +1,22 @@
+[build-system]
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "pdfmodule"
+version = "0.1.0"
+description = "PyMuPDF-like PDF analysis tools powered by Rust"
+authors = [{ name = "codex", email = "codex@example.com" }]
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Libraries"
+]
+
+[project.urls]
+Homepage = "https://example.com"
+Repository = "https://example.com"
