@@ -8,19 +8,40 @@ use pdf::font::{Font, FontData, FontDescriptor, ToUnicodeMap, Widths};
 use pdf::object::Resolve;
 use pdf::object::{ColorSpace, ImageXObject, MaybeRef, Page, Resources, XObject};
 use pdf::primitive::PdfString;
+use pdfium_render::prelude::{PdfRenderConfig, Pdfium, PdfiumError};
 use png::{BitDepth, ColorType, Encoder};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 
 /// Convert a [`PdfError`] into a Python runtime error.
 fn pdf_err(err: PdfError) -> PyErr {
     PyRuntimeError::new_err(err.to_string())
 }
 
+fn pdfium_err(err: PdfiumError) -> PyErr {
+    match err {
+        PdfiumError::LoadLibraryError(inner) => PyRuntimeError::new_err(format!(
+            "Failed to load Pdfium library: {}. Place a compatible Pdfium shared library in the working directory or install it system-wide.",
+            inner
+        )),
+        PdfiumError::LoadLibraryFunctionNameError(name) => PyRuntimeError::new_err(format!(
+            "Failed to resolve Pdfium symbol '{}'. Ensure the Pdfium library matches the crate configuration.",
+            name
+        )),
+        other => PyRuntimeError::new_err(other.to_string()),
+    }
+}
+
 /// Open a PDF file using the `pdf` crate with the default cached options.
 fn open_pdf(path: &str) -> Result<CachedFile<Vec<u8>>, PdfError> {
     FileOptions::cached().open(path)
+}
+
+fn load_pdfium() -> Result<Pdfium, PdfiumError> {
+    Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./"))
+        .or_else(|_| Pdfium::bind_to_system_library())
+        .map(Pdfium::new)
 }
 
 /// Lightweight representation of a text chunk extracted from a page.
@@ -687,6 +708,17 @@ struct PositionedImage {
     image: ImageResult,
 }
 
+struct RegionImage {
+    index: usize,
+    page_index: usize,
+    input_bbox: (f32, f32, f32, f32),
+    bbox: (f32, f32, f32, f32),
+    pixel_bounds: (u32, u32, u32, u32),
+    image: ImageResult,
+    dpi: f32,
+    scale: f32,
+}
+
 fn collect_positioned_images(
     ops: &[Op],
     resources: Option<&MaybeRef<Resources>>,
@@ -869,8 +901,17 @@ fn assign_captions_to_objects(
 fn encode_png(data: &[u8], width: u32, height: u32, color: ColorType) -> Result<Vec<u8>, PdfError> {
     let mut buffer = Vec::new();
     let mut encoder = Encoder::new(&mut buffer, width, height);
-    encoder.set_color(color);
-    encoder.set_depth(BitDepth::Eight);
+    match color {
+        ColorType::Grayscale | ColorType::Rgb | ColorType::Rgba => {
+            encoder.set_color(color);
+            encoder.set_depth(BitDepth::Eight);
+        }
+        _ => {
+            return Err(PdfError::Other {
+                msg: format!("unsupported PNG color type: {:?}", color),
+            });
+        }
+    }
     let mut writer = encoder
         .write_header()
         .map_err(|e| PdfError::Other { msg: e.to_string() })?;
@@ -1005,6 +1046,60 @@ fn positioned_images_to_pydicts(
     images
         .into_iter()
         .map(|image| positioned_image_to_pydict(py, image))
+        .collect()
+}
+
+fn region_image_to_pydict(py: Python<'_>, region: RegionImage) -> PyResult<Py<PyDict>> {
+    let RegionImage {
+        index,
+        page_index,
+        input_bbox,
+        bbox,
+        pixel_bounds,
+        image,
+        dpi,
+        scale,
+    } = region;
+    let ImageResult {
+        data,
+        width,
+        height,
+        format,
+    } = image;
+    let dict = PyDict::new(py);
+    dict.set_item("type", "region_image")?;
+    dict.set_item("index", index)?;
+    dict.set_item("page_index", page_index)?;
+    dict.set_item("x", bbox.0 as f64)?;
+    dict.set_item("y", bbox.1 as f64)?;
+    set_bbox(&dict, bbox)?;
+    dict.set_item("width", width)?;
+    dict.set_item("height", height)?;
+    dict.set_item("dpi", dpi as f64)?;
+    dict.set_item("scale", scale as f64)?;
+    dict.set_item("format", format)?;
+    dict.set_item("data", PyBytes::new(py, &data))?;
+    dict.set_item("pixel_left", pixel_bounds.0)?;
+    dict.set_item("pixel_top", pixel_bounds.1)?;
+    dict.set_item("pixel_right", pixel_bounds.2)?;
+    dict.set_item("pixel_bottom", pixel_bounds.3)?;
+    let input_tuple = PyTuple::new(
+        py,
+        [
+            input_bbox.0 as f64,
+            input_bbox.1 as f64,
+            input_bbox.2 as f64,
+            input_bbox.3 as f64,
+        ],
+    )?;
+    dict.set_item("input_rect", input_tuple)?;
+    Ok(dict.into())
+}
+
+fn region_images_to_pydicts(py: Python<'_>, images: Vec<RegionImage>) -> PyResult<Vec<Py<PyDict>>> {
+    images
+        .into_iter()
+        .map(|image| region_image_to_pydict(py, image))
         .collect()
 }
 
@@ -1228,6 +1323,135 @@ fn extract_images(py: Python<'_>, path: &str, page_index: usize) -> PyResult<Vec
 }
 
 #[pyfunction]
+#[pyo3(signature = (path, page_index, rectangles, dpi = 144.0))]
+fn extract_region_images(
+    py: Python<'_>,
+    path: &str,
+    page_index: usize,
+    rectangles: Vec<(f32, f32, f32, f32)>,
+    dpi: f32,
+) -> PyResult<Vec<Py<PyDict>>> {
+    if rectangles.is_empty() {
+        return Ok(vec![]);
+    }
+    if !dpi.is_finite() || dpi <= 0.0 {
+        return Err(PyRuntimeError::new_err(
+            "dpi must be a positive finite value",
+        ));
+    }
+
+    let pdfium = load_pdfium().map_err(pdfium_err)?;
+    let document = pdfium.load_pdf_from_file(path, None).map_err(pdfium_err)?;
+    let page_index_u16 = u16::try_from(page_index).map_err(|_| {
+        PyRuntimeError::new_err("page_index exceeds Pdfium limits (must be <= 65535)")
+    })?;
+    let page = document.pages().get(page_index_u16).map_err(pdfium_err)?;
+    let page_width = page.width().value;
+    let page_height = page.height().value;
+    if !page_width.is_finite()
+        || !page_height.is_finite()
+        || page_width <= 0.0
+        || page_height <= 0.0
+    {
+        return Err(PyRuntimeError::new_err("page has non-positive dimensions"));
+    }
+
+    let scale_factor = dpi / 72.0;
+    if !scale_factor.is_finite() || scale_factor <= 0.0 {
+        return Err(PyRuntimeError::new_err(
+            "invalid rendering scale computed from dpi",
+        ));
+    }
+
+    let render_config = PdfRenderConfig::new().scale_page_by_factor(scale_factor);
+    let bitmap = page
+        .render_with_config(&render_config)
+        .map_err(pdfium_err)?;
+    let rendered = bitmap.as_image();
+    let image_width = rendered.width();
+    let image_height = rendered.height();
+    if image_width == 0 || image_height == 0 {
+        return Err(PyRuntimeError::new_err("rendered page has zero dimensions"));
+    }
+
+    let scale_x = image_width as f32 / page_width;
+    let scale_y = image_height as f32 / page_height;
+    if !scale_x.is_finite() || !scale_y.is_finite() || scale_x <= 0.0 || scale_y <= 0.0 {
+        return Err(PyRuntimeError::new_err("unable to compute rendering scale"));
+    }
+
+    let mut regions = Vec::with_capacity(rectangles.len());
+    let page_height_f = page_height;
+    let image_width_f = image_width as f32;
+    let image_height_f = image_height as f32;
+    for (index, &(x0, y0, x1, y1)) in rectangles.iter().enumerate() {
+        let canonical = (x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1));
+        let clamped = (
+            canonical.0.clamp(0.0, page_width),
+            canonical.1.clamp(0.0, page_height),
+            canonical.2.clamp(0.0, page_width),
+            canonical.3.clamp(0.0, page_height),
+        );
+        if clamped.0 >= clamped.2 || clamped.1 >= clamped.3 {
+            return Err(PyRuntimeError::new_err(format!(
+                "rectangle at index {} does not overlap the page bounds",
+                index
+            )));
+        }
+
+        let left_f = (clamped.0 * scale_x).floor();
+        let right_f = (clamped.2 * scale_x).ceil();
+        let top_f = ((page_height_f - clamped.3) * scale_y).floor();
+        let bottom_f = ((page_height_f - clamped.1) * scale_y).ceil();
+
+        let left_px = left_f.clamp(0.0, image_width_f) as u32;
+        let mut right_px = right_f.clamp(0.0, image_width_f) as u32;
+        let top_px = top_f.clamp(0.0, image_height_f) as u32;
+        let mut bottom_px = bottom_f.clamp(0.0, image_height_f) as u32;
+
+        if right_px <= left_px {
+            right_px = right_px.saturating_add(1).min(image_width);
+        }
+        if bottom_px <= top_px {
+            bottom_px = bottom_px.saturating_add(1).min(image_height);
+        }
+        if right_px <= left_px || bottom_px <= top_px {
+            return Err(PyRuntimeError::new_err(format!(
+                "rectangle at index {} produced an empty region after scaling",
+                index
+            )));
+        }
+
+        let crop_width = right_px - left_px;
+        let crop_height = bottom_px - top_px;
+        let cropped = rendered.crop_imm(left_px, top_px, crop_width, crop_height);
+        let rgba = cropped.to_rgba8();
+        let width_px = rgba.width();
+        let height_px = rgba.height();
+        let raw = rgba.into_raw();
+        let png_data = encode_png(&raw, width_px, height_px, ColorType::Rgba).map_err(pdf_err)?;
+        let pixel_bounds = (left_px, top_px, left_px + crop_width, top_px + crop_height);
+        regions.push(RegionImage {
+            index,
+            page_index,
+            input_bbox: (x0, y0, x1, y1),
+            bbox: clamped,
+            pixel_bounds,
+            image: ImageResult {
+                data: png_data,
+                width: width_px,
+                height: height_px,
+                format: "png".into(),
+            },
+            dpi,
+            scale: scale_factor,
+        });
+    }
+
+    region_images_to_pydicts(py, regions)
+}
+
+#[pyfunction]
 fn extract_paths(path: &str, page_index: usize) -> PyResult<Vec<(String, Vec<(f32, f32)>)>> {
     let pdf = open_pdf(path).map_err(pdf_err)?;
     let page = get_page(&pdf, page_index).map_err(pdf_err)?;
@@ -1416,6 +1640,7 @@ fn pdfmodule(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_page_count, m)?)?;
     m.add_function(wrap_pyfunction!(extract_text_with_coords, m)?)?;
     m.add_function(wrap_pyfunction!(extract_images, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_region_images, m)?)?;
     m.add_function(wrap_pyfunction!(extract_paths, m)?)?;
     m.add_function(wrap_pyfunction!(extract_layouts, m)?)?;
     m.add_function(wrap_pyfunction!(extract_page_content, m)?)?;
