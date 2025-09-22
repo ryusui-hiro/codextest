@@ -5,12 +5,12 @@ use pdf::error::PdfError;
 use pdf::file::{CachedFile, FileOptions};
 use pdf::font::{Font, FontData, FontDescriptor, ToUnicodeMap, Widths};
 use pdf::object::Resolve;
-use pdf::object::{ColorSpace, ImageXObject, Page, XObject};
+use pdf::object::{ColorSpace, ImageXObject, MaybeRef, Page, Resources, XObject};
 use pdf::primitive::PdfString;
 use png::{BitDepth, ColorType, Encoder};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::{PyBytes, PyDict, PyList};
 
 /// Convert a [`PdfError`] into a Python runtime error.
 fn pdf_err(err: PdfError) -> PyErr {
@@ -30,6 +30,8 @@ struct TextBlock {
     y0: f32,
     x1: f32,
     y1: f32,
+    baseline_x: f32,
+    baseline_y: f32,
 }
 
 /// Maintain the current text state while iterating over PDF text operators.
@@ -300,12 +302,15 @@ fn build_text_block(
             max_y = y;
         }
     }
+    let (baseline_x, baseline_y) = apply_matrix(&state.text_matrix, (0.0, rise));
     TextBlock {
         text,
         x0: min_x,
         y0: min_y,
         x1: max_x,
         y1: max_y,
+        baseline_x,
+        baseline_y,
     }
 }
 
@@ -426,6 +431,34 @@ fn handle_text_adjusted(
     }
 }
 
+fn collect_text_blocks(ops: &[Op], fonts: &HashMap<String, ResolvedFont>) -> Vec<TextBlock> {
+    let mut state = TextState::default();
+    let mut blocks = Vec::new();
+    for op in ops {
+        match op {
+            Op::BeginText => state.begin_text(),
+            Op::EndText => {}
+            Op::SetTextMatrix { matrix } => state.set_text_matrix(*matrix),
+            Op::MoveTextPosition { translation } => {
+                state.translate_line(translation.x, translation.y)
+            }
+            Op::TextNewline => state.newline(),
+            Op::TextFont { name, size } => state.set_font(name.as_str(), *size),
+            Op::CharSpacing { char_space } => state.set_char_spacing(*char_space),
+            Op::WordSpacing { word_space } => state.set_word_spacing(*word_space),
+            Op::TextScaling { horiz_scale } => state.set_horizontal_scale(*horiz_scale),
+            Op::Leading { leading } => state.set_leading(*leading),
+            Op::TextRise { rise } => state.set_text_rise(*rise),
+            Op::TextDraw { text } => handle_text_draw(&mut state, fonts, text, &mut blocks),
+            Op::TextDrawAdjusted { array } => {
+                handle_text_adjusted(&mut state, fonts, array, &mut blocks)
+            }
+            _ => {}
+        }
+    }
+    blocks
+}
+
 fn collect_paths(ops: &[Op]) -> Vec<(String, Vec<(f32, f32)>)> {
     let mut segments = Vec::new();
     let mut current_point: Option<Point> = None;
@@ -505,6 +538,58 @@ struct PositionedImage {
     image: ImageResult,
 }
 
+fn collect_positioned_images(
+    ops: &[Op],
+    resources: Option<&MaybeRef<Resources>>,
+    resolver: &impl Resolve,
+) -> Result<Vec<PositionedImage>, PdfError> {
+    let mut ctm = Matrix::default();
+    let mut stack: Vec<Matrix> = Vec::new();
+    let mut images = Vec::new();
+    let mut inline_index = 0usize;
+    for op in ops {
+        match op {
+            Op::Save => stack.push(ctm),
+            Op::Restore => ctm = stack.pop().unwrap_or_default(),
+            Op::Transform { matrix } => ctm = concat_matrix(&ctm, matrix),
+            Op::XObject { name } => {
+                if let Some(res) = resources {
+                    if let Some(xobject_ref) = res.xobjects.get(name) {
+                        let xobject = resolver.get(*xobject_ref)?;
+                        if let XObject::Image(image) = &*xobject {
+                            let image_data = extract_image(image, resolver)?;
+                            let (x0, y0, x1, y1) = unit_square_bounds(&ctm);
+                            images.push(PositionedImage {
+                                name: name.as_str().to_owned(),
+                                x0,
+                                y0,
+                                x1,
+                                y1,
+                                image: image_data,
+                            });
+                        }
+                    }
+                }
+            }
+            Op::InlineImage { image } => {
+                let image_data = extract_image(image, resolver)?;
+                inline_index += 1;
+                let (x0, y0, x1, y1) = unit_square_bounds(&ctm);
+                images.push(PositionedImage {
+                    name: format!("inline_{}", inline_index),
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    image: image_data,
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(images)
+}
+
 fn encode_png(data: &[u8], width: u32, height: u32, color: ColorType) -> Result<Vec<u8>, PdfError> {
     let mut buffer = Vec::new();
     let mut encoder = Encoder::new(&mut buffer, width, height);
@@ -577,6 +662,120 @@ fn extract_image(image: &ImageXObject, resolver: &impl Resolve) -> Result<ImageR
     }
 }
 
+fn text_block_to_pydict(py: Python<'_>, block: TextBlock) -> PyResult<Py<PyDict>> {
+    let TextBlock {
+        text,
+        x0,
+        y0,
+        x1,
+        y1,
+        baseline_x,
+        baseline_y,
+    } = block;
+    let dict = PyDict::new(py);
+    dict.set_item("type", "text")?;
+    dict.set_item("text", text)?;
+    dict.set_item("x", baseline_x as f64)?;
+    dict.set_item("y", baseline_y as f64)?;
+    dict.set_item("x0", x0 as f64)?;
+    dict.set_item("y0", y0 as f64)?;
+    dict.set_item("x1", x1 as f64)?;
+    dict.set_item("y1", y1 as f64)?;
+    Ok(dict.into())
+}
+
+fn text_blocks_to_pydicts(py: Python<'_>, blocks: Vec<TextBlock>) -> PyResult<Vec<Py<PyDict>>> {
+    blocks
+        .into_iter()
+        .map(|block| text_block_to_pydict(py, block))
+        .collect()
+}
+
+fn positioned_image_to_pydict(py: Python<'_>, positioned: PositionedImage) -> PyResult<Py<PyDict>> {
+    let PositionedImage {
+        name,
+        x0,
+        y0,
+        x1,
+        y1,
+        image,
+    } = positioned;
+    let ImageResult {
+        data,
+        width,
+        height,
+        format,
+    } = image;
+    let dict = PyDict::new(py);
+    dict.set_item("type", "image")?;
+    dict.set_item("name", name)?;
+    dict.set_item("x", x0 as f64)?;
+    dict.set_item("y", y0 as f64)?;
+    dict.set_item("x0", x0 as f64)?;
+    dict.set_item("y0", y0 as f64)?;
+    dict.set_item("x1", x1 as f64)?;
+    dict.set_item("y1", y1 as f64)?;
+    dict.set_item("width", width)?;
+    dict.set_item("height", height)?;
+    dict.set_item("format", format)?;
+    dict.set_item("data", PyBytes::new(py, &data))?;
+    Ok(dict.into())
+}
+
+fn positioned_images_to_pydicts(
+    py: Python<'_>,
+    images: Vec<PositionedImage>,
+) -> PyResult<Vec<Py<PyDict>>> {
+    images
+        .into_iter()
+        .map(|image| positioned_image_to_pydict(py, image))
+        .collect()
+}
+
+fn points_bbox(points: &[(f32, f32)]) -> Option<(f32, f32, f32, f32)> {
+    if points.is_empty() {
+        return None;
+    }
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for &(x, y) in points {
+        if x < min_x {
+            min_x = x;
+        }
+        if x > max_x {
+            max_x = x;
+        }
+        if y < min_y {
+            min_y = y;
+        }
+        if y > max_y {
+            max_y = y;
+        }
+    }
+    Some((min_x, min_y, max_x, max_y))
+}
+
+fn path_segment_to_pydict(
+    py: Python<'_>,
+    kind: String,
+    points: Vec<(f32, f32)>,
+) -> PyResult<Py<PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("type", "path")?;
+    dict.set_item("kind", kind)?;
+    let coords: Vec<(f64, f64)> = points.iter().map(|&(x, y)| (x as f64, y as f64)).collect();
+    dict.set_item("points", coords)?;
+    if let Some((x0, y0, x1, y1)) = points_bbox(&points) {
+        dict.set_item("x0", x0 as f64)?;
+        dict.set_item("y0", y0 as f64)?;
+        dict.set_item("x1", x1 as f64)?;
+        dict.set_item("y1", y1 as f64)?;
+    }
+    Ok(dict.into())
+}
+
 #[pyfunction]
 fn get_page_count(path: &str) -> PyResult<usize> {
     let pdf = open_pdf(path).map_err(pdf_err)?;
@@ -606,48 +805,8 @@ fn extract_text_with_coords(
         None => return Ok(vec![]),
     };
     let operations = content.operations(&resolver).map_err(pdf_err)?;
-    let mut state = TextState::default();
-    let mut blocks = Vec::new();
-    for op in operations {
-        match op {
-            Op::BeginText => state.begin_text(),
-            Op::EndText => {}
-            Op::SetTextMatrix { matrix } => state.set_text_matrix(matrix),
-            Op::MoveTextPosition { translation } => {
-                state.translate_line(translation.x, translation.y)
-            }
-            Op::TextNewline => state.newline(),
-            Op::TextFont { name, size } => state.set_font(name.as_str(), size),
-            Op::CharSpacing { char_space } => state.set_char_spacing(char_space),
-            Op::WordSpacing { word_space } => state.set_word_spacing(word_space),
-            Op::TextScaling { horiz_scale } => state.set_horizontal_scale(horiz_scale),
-            Op::Leading { leading } => state.set_leading(leading),
-            Op::TextRise { rise } => state.set_text_rise(rise),
-            Op::TextDraw { text } => handle_text_draw(&mut state, &fonts, &text, &mut blocks),
-            Op::TextDrawAdjusted { array } => {
-                handle_text_adjusted(&mut state, &fonts, &array, &mut blocks)
-            }
-            _ => {}
-        }
-    }
-    let mut output = Vec::with_capacity(blocks.len());
-    for block in blocks {
-        let TextBlock {
-            text,
-            x0,
-            y0,
-            x1,
-            y1,
-        } = block;
-        let dict = PyDict::new(py);
-        dict.set_item("text", text)?;
-        dict.set_item("x0", x0 as f64)?;
-        dict.set_item("y0", y0 as f64)?;
-        dict.set_item("x1", x1 as f64)?;
-        dict.set_item("y1", y1 as f64)?;
-        output.push(dict.into());
-    }
-    Ok(output)
+    let blocks = collect_text_blocks(&operations, &fonts);
+    text_blocks_to_pydicts(py, blocks)
 }
 
 #[pyfunction]
@@ -662,85 +821,8 @@ fn extract_images(py: Python<'_>, path: &str, page_index: usize) -> PyResult<Vec
     };
     let operations = content.operations(&resolver).map_err(pdf_err)?;
     let resources = page_ref.resources().ok();
-    let mut ctm = Matrix::default();
-    let mut stack: Vec<Matrix> = Vec::new();
-    let mut images: Vec<PositionedImage> = Vec::new();
-    let mut inline_index = 0usize;
-    for op in operations {
-        match op {
-            Op::Save => stack.push(ctm),
-            Op::Restore => ctm = stack.pop().unwrap_or_default(),
-            Op::Transform { matrix } => ctm = concat_matrix(&ctm, &matrix),
-            Op::XObject { name } => {
-                if let Some(res) = resources {
-                    if let Some(xobject_ref) = res.xobjects.get(&name) {
-                        let xobject = resolver.get(*xobject_ref).map_err(pdf_err)?;
-                        if let XObject::Image(image) = &*xobject {
-                            match extract_image(image, &resolver) {
-                                Ok(image_data) => {
-                                    let (x0, y0, x1, y1) = unit_square_bounds(&ctm);
-                                    images.push(PositionedImage {
-                                        name: name.as_str().to_owned(),
-                                        x0,
-                                        y0,
-                                        x1,
-                                        y1,
-                                        image: image_data,
-                                    });
-                                }
-                                Err(err) => return Err(pdf_err(err)),
-                            }
-                        }
-                    }
-                }
-            }
-            Op::InlineImage { image } => match extract_image(&image, &resolver) {
-                Ok(image_data) => {
-                    inline_index += 1;
-                    let (x0, y0, x1, y1) = unit_square_bounds(&ctm);
-                    images.push(PositionedImage {
-                        name: format!("inline_{}", inline_index),
-                        x0,
-                        y0,
-                        x1,
-                        y1,
-                        image: image_data,
-                    });
-                }
-                Err(err) => return Err(pdf_err(err)),
-            },
-            _ => {}
-        }
-    }
-    let mut output = Vec::with_capacity(images.len());
-    for positioned in images {
-        let PositionedImage {
-            name,
-            x0,
-            y0,
-            x1,
-            y1,
-            image,
-        } = positioned;
-        let ImageResult {
-            data,
-            width,
-            height,
-            format,
-        } = image;
-        let dict = PyDict::new(py);
-        dict.set_item("name", name)?;
-        dict.set_item("x0", x0 as f64)?;
-        dict.set_item("y0", y0 as f64)?;
-        dict.set_item("x1", x1 as f64)?;
-        dict.set_item("y1", y1 as f64)?;
-        dict.set_item("width", width)?;
-        dict.set_item("height", height)?;
-        dict.set_item("format", format)?;
-        dict.set_item("data", PyBytes::new(py, &data))?;
-        output.push(dict.into());
-    }
-    Ok(output)
+    let images = collect_positioned_images(&operations, resources, &resolver).map_err(pdf_err)?;
+    positioned_images_to_pydicts(py, images)
 }
 
 #[pyfunction]
@@ -757,11 +839,68 @@ fn extract_paths(path: &str, page_index: usize) -> PyResult<Vec<(String, Vec<(f3
     Ok(collect_paths(&operations))
 }
 
+#[pyfunction]
+fn extract_page_content(py: Python<'_>, path: &str, page_index: usize) -> PyResult<Py<PyDict>> {
+    let pdf = open_pdf(path).map_err(pdf_err)?;
+    let page = get_page(&pdf, page_index).map_err(pdf_err)?;
+    let page_ref: &Page = &page;
+    let resolver = pdf.resolver();
+    let fonts = collect_fonts(page_ref, &resolver).map_err(pdf_err)?;
+    let resources = page_ref.resources().ok();
+    let content = match &page_ref.contents {
+        Some(content) => content,
+        None => {
+            let page_dict = PyDict::new(py);
+            page_dict.set_item("page_index", page_index)?;
+            page_dict.set_item("text", PyList::empty(py))?;
+            page_dict.set_item("images", PyList::empty(py))?;
+            page_dict.set_item("objects", PyList::empty(py))?;
+            page_dict.set_item("items", PyList::empty(py))?;
+            return Ok(page_dict.into());
+        }
+    };
+    let operations = content.operations(&resolver).map_err(pdf_err)?;
+    let text_entries = text_blocks_to_pydicts(py, collect_text_blocks(&operations, &fonts))?;
+    let image_entries = positioned_images_to_pydicts(
+        py,
+        collect_positioned_images(&operations, resources, &resolver).map_err(pdf_err)?,
+    )?;
+    let object_entries = collect_paths(&operations)
+        .into_iter()
+        .map(|(kind, points)| path_segment_to_pydict(py, kind, points))
+        .collect::<PyResult<Vec<_>>>()?;
+
+    let text_list = PyList::new(py, &text_entries)?;
+    let image_list = PyList::new(py, &image_entries)?;
+    let object_list = PyList::new(py, &object_entries)?;
+
+    let mut all_items: Vec<Py<PyAny>> = Vec::new();
+    for entry in &text_entries {
+        all_items.push(entry.clone_ref(py).into());
+    }
+    for entry in &image_entries {
+        all_items.push(entry.clone_ref(py).into());
+    }
+    for entry in &object_entries {
+        all_items.push(entry.clone_ref(py).into());
+    }
+    let items_list = PyList::new(py, &all_items)?;
+
+    let page_dict = PyDict::new(py);
+    page_dict.set_item("page_index", page_index)?;
+    page_dict.set_item("text", text_list)?;
+    page_dict.set_item("images", image_list)?;
+    page_dict.set_item("objects", object_list)?;
+    page_dict.set_item("items", items_list)?;
+    Ok(page_dict.into())
+}
+
 #[pymodule]
 fn pdfmodule(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_page_count, m)?)?;
     m.add_function(wrap_pyfunction!(extract_text_with_coords, m)?)?;
     m.add_function(wrap_pyfunction!(extract_images, m)?)?;
     m.add_function(wrap_pyfunction!(extract_paths, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_page_content, m)?)?;
     Ok(())
 }
