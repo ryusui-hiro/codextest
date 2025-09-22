@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use pdf::content::{Matrix, Op, Point, Rect, TextDrawAdjusted};
 use pdf::error::PdfError;
 use pdf::file::{CachedFile, FileOptions};
-use pdf::font::{Font, ToUnicodeMap, Widths};
+use pdf::font::{Font, FontData, FontDescriptor, ToUnicodeMap, Widths};
 use pdf::object::Resolve;
 use pdf::object::{ColorSpace, ImageXObject, Page, XObject};
 use pdf::primitive::PdfString;
@@ -26,8 +26,10 @@ fn open_pdf(path: &str) -> Result<CachedFile<Vec<u8>>, PdfError> {
 #[derive(Debug)]
 struct TextBlock {
     text: String,
-    x: f32,
-    y: f32,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
 }
 
 /// Maintain the current text state while iterating over PDF text operators.
@@ -131,6 +133,7 @@ struct ResolvedFont {
     widths: Option<Widths>,
     to_unicode: Option<ToUnicodeMap>,
     is_cid: bool,
+    metrics: Option<(f32, f32)>,
 }
 
 impl ResolvedFont {
@@ -140,10 +143,12 @@ impl ResolvedFont {
             Some(map) => Some(map?),
             None => None,
         };
+        let metrics = resolve_font_metrics(font);
         Ok(Self {
             widths,
             to_unicode,
             is_cid: font.is_cid(),
+            metrics,
         })
     }
 
@@ -161,6 +166,33 @@ impl ResolvedFont {
             .as_ref()
             .map(|w| w.get(code as usize))
             .unwrap_or(1000.0)
+    }
+
+    fn metrics(&self) -> Option<(f32, f32)> {
+        self.metrics
+    }
+}
+
+fn descriptor_metrics(descriptor: &FontDescriptor) -> (f32, f32) {
+    let ascent = descriptor.ascent.unwrap_or(descriptor.font_bbox.top);
+    let descent = descriptor.descent.unwrap_or(descriptor.font_bbox.bottom);
+    (ascent, descent)
+}
+
+fn resolve_font_metrics(font: &Font) -> Option<(f32, f32)> {
+    match &font.data {
+        FontData::Type0(type0) => type0
+            .descendant_fonts
+            .get(0)
+            .and_then(|descendant| resolve_font_metrics(descendant)),
+        FontData::Type1(info) | FontData::TrueType(info) => info
+            .font_descriptor
+            .as_ref()
+            .map(|descriptor| descriptor_metrics(descriptor)),
+        FontData::CIDFontType0(cid) | FontData::CIDFontType2(cid) => {
+            Some(descriptor_metrics(&cid.font_descriptor))
+        }
+        _ => None,
     }
 }
 
@@ -226,6 +258,55 @@ fn compute_text_displacement(font: Option<&ResolvedFont>, codes: &[u16], state: 
         total += advance;
     }
     total * (state.horizontal_scale / 100.0)
+}
+
+const DEFAULT_ASCENT: f32 = 800.0;
+const DEFAULT_DESCENT: f32 = -200.0;
+
+fn build_text_block(
+    state: &TextState,
+    text: String,
+    displacement: f32,
+    metrics: (f32, f32),
+) -> TextBlock {
+    let (raw_ascent, raw_descent) = metrics;
+    let ascent = (raw_ascent / 1000.0) * state.font_size;
+    let descent = (raw_descent / 1000.0) * state.font_size;
+    let rise = state.text_rise;
+    let points = [
+        (0.0, rise),
+        (displacement, rise),
+        (0.0, ascent + rise),
+        (displacement, ascent + rise),
+        (0.0, descent + rise),
+        (displacement, descent + rise),
+    ];
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for &(x_offset, y_offset) in &points {
+        let (x, y) = apply_matrix(&state.text_matrix, (x_offset, y_offset));
+        if x < min_x {
+            min_x = x;
+        }
+        if x > max_x {
+            max_x = x;
+        }
+        if y < min_y {
+            min_y = y;
+        }
+        if y > max_y {
+            max_y = y;
+        }
+    }
+    TextBlock {
+        text,
+        x0: min_x,
+        y0: min_y,
+        x1: max_x,
+        y1: max_y,
+    }
 }
 
 fn multiply_matrix(left: &Matrix, right: &Matrix) -> Matrix {
@@ -314,14 +395,12 @@ fn handle_text_draw(
     if decoded.text.is_empty() {
         return;
     }
-    let (x, mut y) = apply_matrix(&state.text_matrix, (0.0, 0.0));
-    y += state.text_rise;
-    blocks.push(TextBlock {
-        text: decoded.text,
-        x,
-        y,
-    });
     let displacement = compute_text_displacement(font, &decoded.codes, state);
+    let metrics = font
+        .and_then(|resolved| resolved.metrics())
+        .unwrap_or((DEFAULT_ASCENT, DEFAULT_DESCENT));
+    let block = build_text_block(state, decoded.text, displacement, metrics);
+    blocks.push(block);
     if displacement != 0.0 {
         state.translate_text(displacement);
     }
@@ -512,7 +591,11 @@ fn get_page<'a>(
 }
 
 #[pyfunction]
-fn extract_text_with_coords(path: &str, page_index: usize) -> PyResult<Vec<(String, f32, f32)>> {
+fn extract_text_with_coords(
+    py: Python<'_>,
+    path: &str,
+    page_index: usize,
+) -> PyResult<Vec<Py<PyDict>>> {
     let pdf = open_pdf(path).map_err(pdf_err)?;
     let page = get_page(&pdf, page_index).map_err(pdf_err)?;
     let page_ref: &Page = &page;
@@ -547,7 +630,24 @@ fn extract_text_with_coords(path: &str, page_index: usize) -> PyResult<Vec<(Stri
             _ => {}
         }
     }
-    Ok(blocks.into_iter().map(|b| (b.text, b.x, b.y)).collect())
+    let mut output = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        let TextBlock {
+            text,
+            x0,
+            y0,
+            x1,
+            y1,
+        } = block;
+        let dict = PyDict::new(py);
+        dict.set_item("text", text)?;
+        dict.set_item("x0", x0 as f64)?;
+        dict.set_item("y0", y0 as f64)?;
+        dict.set_item("x1", x1 as f64)?;
+        dict.set_item("y1", y1 as f64)?;
+        output.push(dict.into());
+    }
+    Ok(output)
 }
 
 #[pyfunction]
