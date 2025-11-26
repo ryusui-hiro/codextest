@@ -3,7 +3,7 @@ requires = ["maturin>=1.4,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "pdfmodule"
+name = "pdfvectorizer"
 version = "0.1.0"
 description = "PyMuPDF-like PDF analysis tools powered by Rust"
 authors = [{ name = "codex", email = "codex@example.com" }]

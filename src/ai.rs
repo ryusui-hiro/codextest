@@ -1,5 +1,7 @@
 use std::fs;
 use std::io;
+use std::io::Read;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use image::{DynamicImage, GenericImageView, ImageBuffer, Rgb};
@@ -126,6 +128,18 @@ pub const SWINIR_X4_ONNX: &str =
 
 /// Download an ONNX model to the specified directory.
 pub fn download_model(url: &str, output_dir: impl AsRef<Path>) -> Result<PathBuf, AiError> {
+    download_model_with_progress(url, output_dir, None::<fn(u64, Option<u64>)>)
+}
+
+/// Download an ONNX model and report incremental progress through the provided callback.
+pub fn download_model_with_progress<F>(
+    url: &str,
+    output_dir: impl AsRef<Path>,
+    mut progress: Option<F>,
+) -> Result<PathBuf, AiError>
+where
+    F: FnMut(u64, Option<u64>),
+{
     let dir = output_dir.as_ref();
     fs::create_dir_all(dir)?;
     let filename = url
@@ -137,8 +151,24 @@ pub fn download_model(url: &str, output_dir: impl AsRef<Path>) -> Result<PathBuf
 
     let client = Client::builder().gzip(true).brotli(true).build()?;
     let mut response = client.get(url).send()?.error_for_status()?;
+    let total_size = response.content_length();
     let mut file = fs::File::create(&output_path)?;
-    io::copy(&mut response, &mut file)?;
+
+    let mut downloaded = 0u64;
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        let read = response.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+
+        file.write_all(&buffer[..read])?;
+        downloaded += read as u64;
+
+        if let Some(ref mut cb) = progress {
+            cb(downloaded, total_size);
+        }
+    }
 
     Ok(output_path)
 }

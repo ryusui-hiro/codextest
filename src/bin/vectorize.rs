@@ -1,12 +1,14 @@
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, ValueEnum};
 use image::DynamicImage;
 use image::imageops::{FilterType, blur, unsharpen};
-use pdfmodule::ai::{
+use pdfvectorizer::ai::{
     ChannelOrder, SuperResolutionEngine, dynamic_image_to_nchw_f32, nchw_f32_to_dynamic_image,
 };
+use thiserror::Error;
 use visioncortex::{CompoundPath, PathSimplifyMode};
 use vtracer::{ColorImage, ColorMode, Config, Hierarchical, SvgFile, conversion};
 
@@ -178,7 +180,23 @@ struct SmoothingSettings {
     segment_length: f64,
 }
 
-fn main() -> Result<(), String> {
+#[derive(Debug, Error)]
+enum VectorizeError {
+    #[error("failed to open input image {0}: {1}")]
+    OpenInput(PathBuf, image::ImageError),
+    #[error("failed to load super-resolution model {0}: {1}")]
+    LoadModel(PathBuf, pdfvectorizer::ai::AiError),
+    #[error("super-resolution inference failed: {0}")]
+    SuperResolution(pdfvectorizer::ai::AiError),
+    #[error("failed to convert inference output: {0}")]
+    ConvertOutput(pdfvectorizer::ai::AiError),
+    #[error("vectorization failed: {0}")]
+    Vectorization(String),
+    #[error("failed to write SVG to {0}: {1}")]
+    WriteOutput(PathBuf, std::io::Error),
+}
+
+fn main() -> Result<(), VectorizeError> {
     let args = Args::parse();
 
     let output = args
@@ -186,6 +204,7 @@ fn main() -> Result<(), String> {
         .clone()
         .unwrap_or_else(|| default_output(&args.input));
 
+    let mut load_step = StepLogger::start("Opening input image...");
     let mut config = Config::default();
     config.color_mode = match args.color_mode {
         ColorChoice::Color => ColorMode::Color,
@@ -242,37 +261,70 @@ fn main() -> Result<(), String> {
     let preprocess_settings = resolve_preprocess_settings(&args);
     let smoothing_settings = resolve_smoothing_settings(&args);
 
-    let raster = image::open(&args.input)
-        .map_err(|e| format!("failed to open input image {}: {e}", args.input.display()))?;
+    let raster =
+        image::open(&args.input).map_err(|e| VectorizeError::OpenInput(args.input.clone(), e))?;
+    let (original_w, original_h) = raster.dimensions();
     let prepared = resize_if_needed(&raster, args.max_dimension);
+    let (prep_w, prep_h) = prepared.dimensions();
+    if (original_w, original_h) == (prep_w, prep_h) {
+        load_step.finish(format!(
+            "Loaded {} ({original_w}x{original_h})",
+            args.input.display()
+        ));
+    } else {
+        load_step.finish(format!(
+            "Loaded {} and resized to {}x{} (from {}x{})",
+            args.input.display(),
+            prep_w,
+            prep_h,
+            original_w,
+            original_h
+        ));
+    }
 
     let enhanced = if let Some(model_path) = args.superres_model.as_ref() {
+        let mut sr_step = StepLogger::start("Running super-resolution model...");
         let channel_order = channel_order_choice_to_channel_order(&args.channel_order);
-        let engine = SuperResolutionEngine::from_onnx(model_path).map_err(|e| {
-            format!(
-                "failed to load super-resolution model {}: {e}",
-                model_path.display()
-            )
-        })?;
+        let engine = SuperResolutionEngine::from_onnx(model_path)
+            .map_err(|e| VectorizeError::LoadModel(model_path.clone(), e))?;
         let tensor = dynamic_image_to_nchw_f32(&prepared, channel_order);
         let output = engine
             .run(&tensor)
-            .map_err(|e| format!("super-resolution inference failed: {e}"))?;
+            .map_err(VectorizeError::SuperResolution)?;
         let upscaled = nchw_f32_to_dynamic_image(&output, channel_order)
-            .map_err(|e| format!("failed to convert inference output: {e}"))?;
-        resize_if_needed(&upscaled, args.max_dimension)
+            .map_err(VectorizeError::ConvertOutput)?;
+        let resized = resize_if_needed(&upscaled, args.max_dimension);
+        let (w, h) = resized.dimensions();
+        sr_step.finish(format!(
+            "Super-resolution completed ({}x{}, channel order {:?})",
+            w, h, channel_order
+        ));
+        resized
     } else {
+        let mut sr_step = StepLogger::start("Super-resolution not requested");
+        sr_step.finish("Super-resolution skipped (no model provided)");
         prepared
     };
 
+    let mut pre_step = StepLogger::start("Applying pre-filters...");
     let prefiltered = apply_pre_filters(&enhanced, &preprocess_settings);
+    pre_step.finish("Pre-filters applied");
     let color_image = dynamic_image_to_color_image(&prefiltered);
-    let svg = conversion::convert(color_image, config)?;
-    let svg = smooth_svg(svg, &smoothing_settings);
-    fs::write(&output, svg.to_string())
-        .map_err(|e| format!("failed to write SVG to {}: {e}", output.display()))?;
+    let mut trace_step = StepLogger::start("Tracing vector paths...");
+    let svg = conversion::convert(color_image, config).map_err(VectorizeError::Vectorization)?;
+    trace_step.finish(format!(
+        "Vector tracing complete ({} paths)",
+        svg.paths.len()
+    ));
 
-    println!("Saved SVG to {}", output.display());
+    let mut smooth_step = StepLogger::start("Smoothing SVG paths...");
+    let svg = smooth_svg(svg, &smoothing_settings);
+    smooth_step.finish("Smoothing complete");
+
+    let mut write_step = StepLogger::start("Writing SVG output...");
+    fs::write(&output, svg.to_string())
+        .map_err(|e| VectorizeError::WriteOutput(output.clone(), e))?;
+    write_step.finish(format!("Saved SVG to {}", output.display()));
     Ok(())
 }
 
@@ -492,5 +544,22 @@ fn channel_order_choice_to_channel_order(choice: &ChannelOrderChoice) -> Channel
     match choice {
         ChannelOrderChoice::Rgb => ChannelOrder::Rgb,
         ChannelOrderChoice::Bgr => ChannelOrder::Bgr,
+    }
+}
+
+struct StepLogger {
+    message: String,
+}
+
+impl StepLogger {
+    fn start(message: impl Into<String>) -> Self {
+        let msg = message.into();
+        println!("[ ] {msg}");
+        Self { message: msg }
+    }
+
+    fn finish(&mut self, detail: impl AsRef<str>) {
+        println!("[✓] {}: {}", self.message, detail.as_ref());
+        let _ = io::stdout().flush();
     }
 }
