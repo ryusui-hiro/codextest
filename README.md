@@ -8,7 +8,7 @@ Rust製のPDF解析機能をPythonから利用できるようにした拡張モ�
 ### 進捗ログ
 - [x] **Phase 1: ベースラインの実装（純粋なベクター変換）** — `vtracer` + `clap` でラスタ画像をSVG化するCLIを実装。イラスト向けにノイズ除去と曲線の滑らかさを優先するプリセットを追加し、`input.jpg` → `output.svg` の流れを確立。
 - [x] **Phase 2: AI推論エンジンの統合（前処理）** — `ort` と `Real-ESRGAN/SwinIR` のONNXモデルを読み込み、`image::DynamicImage` と `ndarray::Array4<f32>` の相互変換を実装する。
-- [ ] **Phase 3: パイプラインの結合とメモリ最適化** — 超解像結果をメモリ上で `vtracer` に渡し、ディスクI/Oを挟まずに高速ベクター化する。大判画像への自動リサイズも盛り込む。
+- [x] **Phase 3: パイプラインの結合とメモリ最適化** — 超解像結果をメモリ上で `vtracer` に渡し、ディスクI/Oを挟まずに高速ベクター化する。大判画像への自動リサイズも盛り込む。
 - [ ] **Phase 4: 品質チューニング（High Precision Mode）** — 量子化オプション、前処理フィルター強化、SVGパスのスムージングを追加して「非常に高精度」と言える仕上がりにする。
 - [ ] **Phase 5: 配布用パッケージング** — エラーハンドリング強化、進行状況バー導入、`cargo build --release` での配布バイナリ整備。
 
@@ -23,6 +23,11 @@ Phase 2以降は上記のロードマップに沿って、AI超解像（`ort` + 
 - `ort` を用いた ONNX Runtime のラッパー `SuperResolutionEngine` を実装し、Real-ESRGAN/SwinIR のモデルをそのまま読み込んで推論できるようにしました。
 - `image::DynamicImage` と `ndarray::Array4<f32>`（NCHWレイアウト）の相互変換ヘルパーを用意し、RGB/BGRのチャンネル順を指定して0〜1へ正規化・復元できます。
 - Real-ESRGAN/SwinIR の公開ONNXモデルをダウンロードする CLI `download_models` を追加しました（既存ファイルはスキップ）。
+
+### Phase 3で追加したもの（オンメモリ結合 + 自動リサイズ）
+- `vectorize` CLI に超解像ONNXモデルを指定する `--superres-model` オプションを追加し、`image -> tensor -> image -> SVG` の流れを全てメモリ上で処理するようにしました。推論結果の画像は `vtracer` の `ColorImage` に直接変換し、ディスクI/Oを挟みません。
+- Real-ESRGANなどで一般的なBGR入力に合わせてチャンネル順を切り替える `--channel-order` を新設しました（デフォルトBGR）。
+- メモリ節約と推論速度のため、入力/出力の最大辺を `--max-dimension` で指定し、大判画像は自動リサイズした上で超解像・ベクター化します（デフォルト4096px）。
 
 #### 変換・推論の使い方（Rust）
 ```rust
@@ -140,3 +145,6 @@ vectorize input.png --filter-speckle 2 --corner-threshold 80 --path-precision 2 
 - `--max-iterations <N>`: ベジェ近似の最大繰り返し回数。
 - `--path-precision <桁数>` / `--round-coords <true|false>`: SVG座標の精度や丸め設定。
 - `--optimize-paths <true|false>`: パス最適化のオン/オフ。
+- `--superres-model <path>`: 超解像ONNXモデルを指定し、オンメモリで前処理してからベクター化。
+- `--channel-order [rgb|bgr]`: モデルが期待するチャンネル順を切り替え（デフォルトBGR）。
+- `--max-dimension <px>`: 入力/出力画像の最大辺。超過する場合は自動リサイズしてメモリ使用量を抑制。

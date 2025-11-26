@@ -1,7 +1,13 @@
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, ValueEnum};
-use vtracer::{ColorMode, Config, Hierarchical, Mode, conversion};
+use image::DynamicImage;
+use image::imageops::FilterType;
+use pdfmodule::ai::{
+    ChannelOrder, SuperResolutionEngine, dynamic_image_to_nchw_f32, nchw_f32_to_dynamic_image,
+};
+use vtracer::{ColorImage, ColorMode, Config, Hierarchical, Mode, conversion};
 
 #[derive(Debug, Clone, ValueEnum)]
 enum ColorChoice {
@@ -27,6 +33,12 @@ enum PresetChoice {
     Illustration,
     /// 写実的な写真など、色数やエッジ保持を優先する汎用プリセット
     Natural,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum ChannelOrderChoice {
+    Rgb,
+    Bgr,
 }
 
 #[derive(Debug, Parser)]
@@ -58,6 +70,18 @@ struct Args {
     /// Tuned presets for typical use-cases
     #[arg(long, value_enum, default_value_t = PresetChoice::Illustration)]
     preset: PresetChoice,
+
+    /// Optional ONNX super-resolution model to run before tracing
+    #[arg(long)]
+    superres_model: Option<PathBuf>,
+
+    /// Channel ordering expected by the super-resolution model
+    #[arg(long, value_enum, default_value_t = ChannelOrderChoice::Bgr)]
+    channel_order: ChannelOrderChoice,
+
+    /// Downscale very large images before/after super-resolution to keep memory usage manageable
+    #[arg(long, default_value_t = 4096)]
+    max_dimension: u32,
 
     /// Remove small speckles in the traced result (0 disables filtering)
     #[arg(long)]
@@ -152,7 +176,33 @@ fn main() -> Result<(), String> {
         config.optimize_paths = optimize_paths;
     }
 
-    conversion::convert_image_to_svg(&args.input, &output, config)?;
+    let raster = image::open(&args.input)
+        .map_err(|e| format!("failed to open input image {}: {e}", args.input.display()))?;
+    let prepared = resize_if_needed(&raster, args.max_dimension);
+
+    let enhanced = if let Some(model_path) = args.superres_model.as_ref() {
+        let channel_order = channel_order_choice_to_channel_order(&args.channel_order);
+        let engine = SuperResolutionEngine::from_onnx(model_path).map_err(|e| {
+            format!(
+                "failed to load super-resolution model {}: {e}",
+                model_path.display()
+            )
+        })?;
+        let tensor = dynamic_image_to_nchw_f32(&prepared, channel_order);
+        let output = engine
+            .run(&tensor)
+            .map_err(|e| format!("super-resolution inference failed: {e}"))?;
+        let upscaled = nchw_f32_to_dynamic_image(&output, channel_order)
+            .map_err(|e| format!("failed to convert inference output: {e}"))?;
+        resize_if_needed(&upscaled, args.max_dimension)
+    } else {
+        prepared
+    };
+
+    let color_image = dynamic_image_to_color_image(&enhanced);
+    let svg = conversion::convert(color_image, config)?;
+    fs::write(&output, svg.to_string())
+        .map_err(|e| format!("failed to write SVG to {}: {e}", output.display()))?;
 
     println!("Saved SVG to {}", output.display());
     Ok(())
@@ -184,5 +234,38 @@ fn apply_preset(config: &mut Config, preset: &PresetChoice) {
             config.round_coords = false;
             config.optimize_paths = true;
         }
+    }
+}
+
+fn dynamic_image_to_color_image(image: &DynamicImage) -> ColorImage {
+    let rgba = image.to_rgba8();
+    ColorImage {
+        pixels: rgba.to_vec(),
+        width: rgba.width() as usize,
+        height: rgba.height() as usize,
+    }
+}
+
+fn resize_if_needed(image: &DynamicImage, max_dimension: u32) -> DynamicImage {
+    if max_dimension == 0 {
+        return image.clone();
+    }
+
+    let (width, height) = image.dimensions();
+    let longest = width.max(height);
+    if longest <= max_dimension {
+        return image.clone();
+    }
+
+    let scale = max_dimension as f32 / longest as f32;
+    let new_width = ((width as f32) * scale).round().max(1.0) as u32;
+    let new_height = ((height as f32) * scale).round().max(1.0) as u32;
+    image.resize(new_width, new_height, FilterType::Lanczos3)
+}
+
+fn channel_order_choice_to_channel_order(choice: &ChannelOrderChoice) -> ChannelOrder {
+    match choice {
+        ChannelOrderChoice::Rgb => ChannelOrder::Rgb,
+        ChannelOrderChoice::Bgr => ChannelOrder::Bgr,
     }
 }
