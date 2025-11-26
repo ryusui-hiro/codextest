@@ -66,6 +66,22 @@ ONNX モデルは事前にダウンロードしておくとオフラインで動
 ## Python API の概要
 Python からは `pdfvectorizer` を import して PDF のページ情報・テキスト・画像・描画パスを取得できます。実装の詳細構成は [CODE.md](./CODE.md) に記載しています。
 
+画像ベクター化も Python から簡単に利用できます。ファイルパスまたは画像バイト列を渡せば SVG 文字列を返し、必要に応じてファイルへ保存できます。
+
+```python
+import pdfvectorizer
+
+# 画像パスを渡して SVG 文字列を取得（自動で大きすぎる画像を縮小）
+svg = pdfvectorizer.vectorize_image("input.png", output_path="output.svg")
+
+# メモリ上の画像バイト列から SVG を取得する場合
+with open("input.jpg", "rb") as f:
+    raw = f.read()
+svg_bytes = pdfvectorizer.vectorize_image_bytes(raw)
+with open("inline.svg", "wb") as f:
+    f.write(svg_bytes)
+```
+
 ## テスト・動作確認
 - Rust コードのビルド確認: `cargo build --release`
 - Python ホイールの生成確認（任意）: `maturin build --release`

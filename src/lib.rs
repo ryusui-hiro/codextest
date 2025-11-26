@@ -19,7 +19,9 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 
-use image::imageops;
+use image::imageops::FilterType;
+use image::{DynamicImage, imageops};
+use vtracer::{ColorImage, Config, conversion};
 
 /// Convert a [`PdfError`] into a Python runtime error.
 fn pdf_err(err: PdfError) -> PyErr {
@@ -1759,6 +1761,71 @@ fn make_rectangle_outline(
     Ok(dict.into())
 }
 
+fn resize_if_needed(image: &DynamicImage, max_dimension: u32) -> DynamicImage {
+    if max_dimension == 0 {
+        return image.clone();
+    }
+
+    let (width, height) = image.dimensions();
+    let longest = width.max(height);
+    if longest <= max_dimension {
+        return image.clone();
+    }
+
+    let scale = max_dimension as f32 / longest as f32;
+    let new_width = ((width as f32) * scale).round().max(1.0) as u32;
+    let new_height = ((height as f32) * scale).round().max(1.0) as u32;
+    image.resize(new_width, new_height, FilterType::Lanczos3)
+}
+
+fn dynamic_image_to_color_image(image: &DynamicImage) -> ColorImage {
+    let rgba = image.to_rgba8();
+    ColorImage {
+        pixels: rgba.to_vec(),
+        width: rgba.width() as usize,
+        height: rgba.height() as usize,
+    }
+}
+
+fn vectorize_dynamic_image(image: &DynamicImage, max_dimension: u32) -> PyResult<String> {
+    let prepared = resize_if_needed(image, max_dimension);
+    let color_image = dynamic_image_to_color_image(&prepared);
+    let svg = conversion::convert(color_image, Config::default())
+        .map_err(|err| PyRuntimeError::new_err(format!("vectorization failed: {err}")))?;
+    Ok(svg.to_string())
+}
+
+#[pyfunction]
+#[pyo3(signature = (image_path, *, output_path = None, max_dimension = 4096))]
+fn vectorize_image(
+    image_path: &str,
+    output_path: Option<&str>,
+    max_dimension: u32,
+) -> PyResult<String> {
+    let image = image::open(image_path).map_err(|err| {
+        PyRuntimeError::new_err(format!("failed to open input image '{image_path}': {err}"))
+    })?;
+    let svg = vectorize_dynamic_image(&image, max_dimension)?;
+
+    if let Some(path) = output_path {
+        fs::write(path, &svg).map_err(|err| {
+            PyRuntimeError::new_err(format!("failed to write SVG to '{path}': {err}"))
+        })?;
+    }
+
+    Ok(svg)
+}
+
+#[pyfunction]
+#[pyo3(signature = (image_bytes, *, max_dimension = 4096))]
+fn vectorize_image_bytes(image_bytes: &[u8], max_dimension: u32) -> PyResult<Py<PyBytes>> {
+    let image = image::load_from_memory(image_bytes).map_err(|err| {
+        PyRuntimeError::new_err(format!("failed to decode input image bytes: {err}"))
+    })?;
+    let svg = vectorize_dynamic_image(&image, max_dimension)?;
+    Python::with_gil(|py| PyBytes::new_bound(py, svg.as_bytes()).into())
+}
+
 #[pymodule]
 fn pdfvectorizer(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_page_count, m)?)?;
@@ -1769,5 +1836,7 @@ fn pdfvectorizer(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_layouts, m)?)?;
     m.add_function(wrap_pyfunction!(extract_page_content, m)?)?;
     m.add_function(wrap_pyfunction!(make_rectangle_outline, m)?)?;
+    m.add_function(wrap_pyfunction!(vectorize_image, m)?)?;
+    m.add_function(wrap_pyfunction!(vectorize_image_bytes, m)?)?;
     Ok(())
 }
