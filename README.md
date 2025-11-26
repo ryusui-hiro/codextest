@@ -1,159 +1,76 @@
-# pdfmodule
+# pdfvectorizer
 
-Rust製のPDF解析機能をPythonから利用できるようにした拡張モジュールです。PDFファイルからテキスト・画像・描画パスなどを抽出し、座標情報付きで扱うことができます。
+Rust 製の PDF 解析・画像ベクター化ツールキットです。Python 拡張としてのライブラリと、配布可能な CLI バイナリ群（`vectorize` / `download_models`）を同じリポジトリで提供します。Phase 5 ではエラーハンドリングと進行状況の可視化を強化し、`cargo build --release` でそのまま配布できる形に仕上げました。コード実装の仕様は [CODE.md](./CODE.md) にまとめています。
 
-## Rust製 AI搭載・高精度ベクター変換エンジン (Rust-AI-Vectorizer) 計画と進捗
-「Vectorizer.ai」と同等の品質を目指し、AIによる超解像を前処理、`vtracer` によるベクター化を後処理とするCLIツールを段階的に育てていきます。画像品質を落とさずSVG化することをゴールに、フェーズごとにREADMEを更新しながら進行状況を記録します。
+## 主な機能
+- **PDF 解析（PyO3 拡張）**: ページ数の取得、テキスト/画像/描画パス抽出、レイアウト情報取得などを Python から呼び出せます。
+- **画像ベクター化 CLI (`vectorize`)**: ラスタ画像を前処理（超解像 + フィルター）→ `vtracer` で SVG 化。プリセットと詳細パラメータを CLI で切り替え可能。
+- **ONNX モデルダウンロード CLI (`download_models`)**: Real-ESRGAN / SwinIR の ONNX モデルを取得。進捗バー付きで大きなファイルも安心。
+- **進行状況バーと詳細なエラー**: 長い処理やネットワーク転送にスピナー/プログレスバーを表示し、失敗時は原因を明示したメッセージで終了します。
 
-### 進捗ログ
-- [x] **Phase 1: ベースラインの実装（純粋なベクター変換）** — `vtracer` + `clap` でラスタ画像をSVG化するCLIを実装。イラスト向けにノイズ除去と曲線の滑らかさを優先するプリセットを追加し、`input.jpg` → `output.svg` の流れを確立。
-- [x] **Phase 2: AI推論エンジンの統合（前処理）** — `ort` と `Real-ESRGAN/SwinIR` のONNXモデルを読み込み、`image::DynamicImage` と `ndarray::Array4<f32>` の相互変換を実装する。
-- [x] **Phase 3: パイプラインの結合とメモリ最適化** — 超解像結果をメモリ上で `vtracer` に渡し、ディスクI/Oを挟まずに高速ベクター化する。大判画像への自動リサイズも盛り込む。
-- [x] **Phase 4: 品質チューニング（High Precision Mode）** — 量子化オプション、前処理フィルター強化、SVGパスのスムージングを追加して「非常に高精度」と言える仕上がりにする。
-- [ ] **Phase 5: 配布用パッケージング** — エラーハンドリング強化、進行状況バー導入、`cargo build --release` での配布バイナリ整備。
-
-### これまでに行ったこと（Phase 1）
-- `vectorize` CLI を整備し、`vtracer` の主要パラメータ（`colormode`、`hierarchical`、`mode` など）をCLI引数から指定可能にしました。
-- イラスト向けのプリセットを新設し、ノイズ除去強め・曲線滑らかめの設定をワンコマンドで適用できるようにしました（詳細は下記CLIの章を参照）。
-
-### 今後の進め方
-Phase 2以降は上記のロードマップに沿って、AI超解像（`ort` + ONNXモデル）→オンメモリ連携→品質チューニングの順で機能を追加していきます。各フェーズ完了ごとにREADMEへ進捗を追記し、使い方やパラメータの推奨値も更新予定です。
-
-### Phase 2で追加したもの（AI前処理）
-- `ort` を用いた ONNX Runtime のラッパー `SuperResolutionEngine` を実装し、Real-ESRGAN/SwinIR のモデルをそのまま読み込んで推論できるようにしました。
-- `image::DynamicImage` と `ndarray::Array4<f32>`（NCHWレイアウト）の相互変換ヘルパーを用意し、RGB/BGRのチャンネル順を指定して0〜1へ正規化・復元できます。
-- Real-ESRGAN/SwinIR の公開ONNXモデルをダウンロードする CLI `download_models` を追加しました（既存ファイルはスキップ）。
-
-### Phase 3で追加したもの（オンメモリ結合 + 自動リサイズ）
-- `vectorize` CLI に超解像ONNXモデルを指定する `--superres-model` オプションを追加し、`image -> tensor -> image -> SVG` の流れを全てメモリ上で処理するようにしました。推論結果の画像は `vtracer` の `ColorImage` に直接変換し、ディスクI/Oを挟みません。
-- Real-ESRGANなどで一般的なBGR入力に合わせてチャンネル順を切り替える `--channel-order` を新設しました（デフォルトBGR）。
-- メモリ節約と推論速度のため、入力/出力の最大辺を `--max-dimension` で指定し、大判画像は自動リサイズした上で超解像・ベクター化します（デフォルト4096px）。
-
-### Phase 4で追加したもの（High Precision Mode）
-- 量子化の粒度を `--color-precision`（1〜8bit）と `--layer-difference` で細かく指定できるようにし、従来の `--colors` もパレット数から自動的にビット深度へマッピングするようにしました。
-- 前処理フィルターを強化し、`--denoise-radius`（ガウシアンぼかし）、`--unsharp-sigma`/`--unsharp-threshold`（アンシャープマスク）、`--enhance-contrast` を組み合わせて超解像後のラスタを「非常に高精度」に整形できます。`--quality high-precision` で高精度向けの既定値がまとまって適用されます。
-- `--smooth-paths` と `--smooth-corner-threshold` などのスムージングパラメータを追加し、`visioncortex` のパス平滑化を自動で走らせることでSVGパスをより滑らかに仕上げます。
-
-#### 変換・推論の使い方（Rust）
-```rust
-use image::open;
-use pdfmodule::ai::{
-    dynamic_image_to_nchw_f32, nchw_f32_to_dynamic_image, ChannelOrder,
-    SuperResolutionEngine, REALESRGAN_X4PLUS_ONNX,
-};
-
-let input = open("input.png")?;
-let tensor = dynamic_image_to_nchw_f32(&input, ChannelOrder::Bgr);
-let engine = SuperResolutionEngine::from_onnx("models/realesrgan-x4plus.onnx")?;
-let output_tensor = engine.run(&tensor)?;
-let upscaled = nchw_f32_to_dynamic_image(&output_tensor, ChannelOrder::Bgr)?;
-upscaled.save("upscaled.png")?;
-```
-
-#### ONNXモデルのダウンロード
-```bash
-cargo run --bin download_models -- --output-dir models
-```
-`models/realesrgan-x4plus.onnx` と `models/swinir_x4.onnx` が保存されます。
-
-## 機能
-- **ページ数の取得**: `get_page_count(path: str) -> int` がPDFの総ページ数を返します。
-- **テキスト抽出**: `extract_text_with_coords(path: str, page_index: int)` は指定ページのテキストを行ごとの辞書リストで返します。各辞書には `type`, `text`, `x`, `y`, `x0`, `y0`, `x1`, `y1` が含まれ、ベースライン座標とバウンディングボックスを確認できます。
-- **画像抽出**: `extract_images(path: str, page_index: int)` はページ内の画像を辞書として返します。返却値には `type`, `name`, `x0`〜`y1` の座標、`width`, `height`, `format`, `data` などが含まれ、`data` はPNGなどのバイナリデータです。
-- **描画パス抽出**: `extract_paths(path: str, page_index: int)` は線分・曲線・矩形などの描画命令を `(kind, points)` のタプルで返します。`kind` は `line`・`curve`・`rect` など、`points` は座標のリストです。
-- **ページ内容の統合取得**: `extract_page_content(path: str, page_index: int)` はページ内のテキスト・画像・パスをまとめた辞書を返します。`text`/`images`/`objects` に加えて、検出したレイアウトをまとめた `layouts` とページ内の項目を順序通り格納した `items` リストを持ちます。
-- **レイアウト抽出**: `extract_layouts(path: str, page_index: int, text_color=None, image_color=None, object_color=None)` はテキスト群、画像、描画オブジェクトをレイアウト単位にまとめた辞書リストを返します。各レイアウトには矩形領域(`x0`〜`y1`)と色指定(`color`)、図表タイトルなどが見つかった場合は `captions` が含まれます。
-- **任意座標の矩形生成**: `make_rectangle_outline(x0, y0, x1, y1, color=None)` は任意の座標範囲に対する矩形枠を辞書として生成し、独自の描画処理に利用できます。
-
-
-> **ページ番号について**: `page_index` は0始まり（最初のページは0）です。
-
-## インストール
-このプロジェクトは [maturin](https://github.com/PyO3/maturin) を利用してビルドします。Python 3.8以上とRustツールチェーンが必要です。
+## クイックスタート
+単純に「画像を SVG にする」最短ルート:
 
 ```bash
-# 依存ツールの導入
+cargo build --release
+./target/release/vectorize input.png  # => input.svg が生成される
+```
+
+Python モジュール経由で PDF を扱う最小例:
+
+```bash
 pip install maturin
-
-# 開発環境へインストール（仮想環境推奨）
-maturin develop --release
-
-# またはwheelをビルドしてからインストール
-maturin build --release
-pip install target/wheels/pdfmodule-*.whl
+maturin develop --release  # ローカル環境にインストール
 ```
 
-## Pythonでの利用例
 ```python
-import pdfmodule
-
-pdf_path = "sample.pdf"
-
-# 総ページ数
-total_pages = pdfmodule.get_page_count(pdf_path)
-print("pages:", total_pages)
-
-# 1ページ目のテキスト（0始まり）
-text_items = pdfmodule.extract_text_with_coords(pdf_path, 0)
-for item in text_items:
-    print(item["text"], item["x0"], item["y0"], item["x1"], item["y1"])
-
-# 画像抽出と保存
-for image in pdfmodule.extract_images(pdf_path, 0):
-    ext = image["format"]  # 例: "png", "jpeg", "raw" など
-    with open(f"{image['name']}.{ext}", "wb") as fh:
-        fh.write(image["data"])
-
-# 描画パスの取得
-path_segments = pdfmodule.extract_paths(pdf_path, 0)
-for kind, points in path_segments:
-    print(kind, points)
-
-# ページ内容をまとめて取得
-page_summary = pdfmodule.extract_page_content(pdf_path, 0)
-print(page_summary["page_index"], len(page_summary["items"]))
-# レイアウトの矩形情報を取得
-layouts = pdfmodule.extract_layouts(pdf_path, 0)
-for layout in layouts:
-    print(layout["type"], layout["x0"], layout["y0"], layout["color"])
-    for caption in layout.get("captions", []):
-        print("  caption:", caption["text"])
+import pdfvectorizer
+print(pdfvectorizer.get_page_count("sample.pdf"))
 ```
 
-それぞれの戻り値は標準的なPythonのデータ構造（辞書、リスト、タプル、バイト列）なので、pandasやPillowなどの外部ライブラリと組み合わせて自在に処理できます。
-
-## 画像をSVGへベクター化するCLI
-`cargo install --path .` などでバイナリをビルドすると、`vectorize` コマンドが利用できます。ラスタ画像をvtracerでトレースしてSVGを生成します。
+## ビルドと配布
+リポジトリ直下でリリースビルドを実行すると、配布に使えるバイナリが `target/release/` に生成されます。
 
 ```bash
-# 入力画像を同名の .svg に変換
-vectorize input.png
+# 依存関係をダウンロードしつつリリースビルド
+cargo build --release
 
-# 出力パスやモードを指定（イラスト向けプリセットがデフォルト）
-vectorize input.jpg --output output.svg --color-mode binary --hierarchy cutout --mode polygon
-
-# 写真向けにプリセットを切り替え、色数を上書き
-vectorize input.png --preset natural --colors 24
-
-# パスの最適化パラメータも上書き可能
-vectorize input.png --filter-speckle 2 --corner-threshold 80 --path-precision 2 --round-coords true
+# 生成物の例
+ls target/release
+# -> vectorize  download_models  libpdfvectorizer.so  ...
 ```
 
-主なオプション:
-- `--color-mode [color|binary]`: カラーモード指定。
-- `--hierarchy [stacked|cutout]`: パスの積層方法。
-- `--mode [spline|polygon]`: スプラインかポリゴンか。
-- `--preset [illustration|natural|high-precision]`: 利用シーンに合わせたプリセット（デフォルトは `illustration`）。
-- `--quality [illustration|natural|high-precision]`: 前処理・スムージングのまとまったチューニングを適用。
-- `--colors <N>`: 量子化する色数（パレット数から自動でビット深度へ変換）。
-- `--color-precision <1-8>` / `--layer-difference <N>`: 量子化のビット深度とレイヤーの分離度を直接指定。
-- `--filter-speckle <N>`: 小さなゴミを除去するピクセル閾値。
-- `--corner-threshold <角度>` / `--length-threshold <長さ>` / `--splice-threshold <値>`: パス簡略化のしきい値。
-- `--max-iterations <N>`: ベジェ近似の最大繰り返し回数。
-- `--path-precision <桁数>`: SVG座標の精度。
-- `--denoise-radius <px>` / `--unsharp-sigma <float>` / `--unsharp-threshold <0-255>` / `--enhance-contrast <float>`: 前処理フィルターの
-  強さを指定。
-- `--smooth-paths <true|false>` / `--smooth-corner-threshold <角度>` / `--smooth-outset-ratio <比率>` / `--smooth-segment-length <長さ>`: SVGパスのスムージング挙動。
-- `--superres-model <path>`: 超解像ONNXモデルを指定し、オンメモリで前処理してからベクター化。
-- `--channel-order [rgb|bgr]`: モデルが期待するチャンネル順を切り替え（デフォルトBGR）。
-- `--max-dimension <px>`: 入力/出力画像の最大辺。超過する場合は自動リサイズしてメモリ使用量を抑制。
+Python 向けホイールを作る場合は [maturin](https://github.com/PyO3/maturin) を利用してください。
+
+```bash
+pip install maturin
+maturin build --release
+pip install target/wheels/pdfvectorizer-*.whl
+```
+
+## CLI の使い方
+### 1. モデルを準備する (`download_models`)
+ONNX モデルは事前にダウンロードしておくとオフラインで動かせます。既に存在する場合はスキップされます。
+
+```bash
+# 標準の models ディレクトリへ保存（進捗バー表示）
+./target/release/download_models
+
+# 保存先を変える場合
+./target/release/download_models --output-dir assets/models
+```
+
+### 2. 画像を SVG に変換する (`vectorize`)
+イラスト向けプリセットがデフォルト。大きな画像は自動でリサイズし、指定すれば超解像モデルを前処理として動かします。詳細オプションや追加例は [CODE.md](./CODE.md) を参照してください。
+
+## Python API の概要
+Python からは `pdfvectorizer` を import して PDF のページ情報・テキスト・画像・描画パスを取得できます。実装の詳細構成は [CODE.md](./CODE.md) に記載しています。
+
+## テスト・動作確認
+- Rust コードのビルド確認: `cargo build --release`
+- Python ホイールの生成確認（任意）: `maturin build --release`
+
+大規模な依存関係を含むため初回ビルドは時間がかかりますが、以降はキャッシュが効いて高速に再ビルドできます。
+
+### ビルド時のよくあるエラー
+- `failed to download from https://index.crates.io/config.json` など crates.io への接続 403/timeout: ネットワークやプロキシで crates.io への HTTPS アクセスが遮断されている可能性があります。社内プロキシ経由での TLS トンネル拒否が多いケースです。環境変数 `HTTPS_PROXY` を設定して認証付きプロキシを経由する、VPN を利用して外部ネットワークに出る、あるいは crates.io ミラー（`CARGO_REGISTRIES_CRATES_IO_PROTOCOL=git` など）を利用してください。

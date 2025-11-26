@@ -1760,7 +1760,7 @@ fn make_rectangle_outline(
 }
 
 #[pymodule]
-fn pdfmodule(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
+fn pdfvectorizer(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_page_count, m)?)?;
     m.add_function(wrap_pyfunction!(extract_text_with_coords, m)?)?;
     m.add_function(wrap_pyfunction!(extract_images, m)?)?;
