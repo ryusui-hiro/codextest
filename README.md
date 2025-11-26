@@ -67,3 +67,28 @@ for layout in layouts:
 ```
 
 それぞれの戻り値は標準的なPythonのデータ構造（辞書、リスト、タプル、バイト列）なので、pandasやPillowなどの外部ライブラリと組み合わせて自在に処理できます。
+
+## 画像をSVGへベクター化するCLI
+`cargo install --path .` などでバイナリをビルドすると、`vectorize` コマンドが利用できます。ラスタ画像をvtracerでトレースしてSVGを生成します。
+
+```bash
+# 入力画像を同名の .svg に変換
+vectorize input.png
+
+# 出力パスやモードを指定
+vectorize input.jpg --output output.svg --color-mode binary --hierarchy cutout --mode polygon --colors 8
+
+# パスの最適化パラメータも上書き可能
+vectorize input.png --filter-speckle 2 --corner-threshold 80 --path-precision 2 --round-coords true
+```
+
+主なオプション:
+- `--color-mode [color|binary]`: カラーモード指定。
+- `--hierarchy [stacked|cutout]`: パスの積層方法。
+- `--mode [spline|polygon]`: スプラインかポリゴンか。
+- `--colors <N>`: 量子化する色数。
+- `--filter-speckle <N>`: 小さなゴミを除去するピクセル閾値。
+- `--corner-threshold <角度>` / `--length-threshold <長さ>` / `--splice-threshold <値>`: パス簡略化のしきい値。
+- `--max-iterations <N>`: ベジェ近似の最大繰り返し回数。
+- `--path-precision <桁数>` / `--round-coords <true|false>`: SVG座標の精度や丸め設定。
+- `--optimize-paths <true|false>`: パス最適化のオン/オフ。
