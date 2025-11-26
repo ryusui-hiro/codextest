@@ -7,7 +7,7 @@ Rust製のPDF解析機能をPythonから利用できるようにした拡張モ�
 
 ### 進捗ログ
 - [x] **Phase 1: ベースラインの実装（純粋なベクター変換）** — `vtracer` + `clap` でラスタ画像をSVG化するCLIを実装。イラスト向けにノイズ除去と曲線の滑らかさを優先するプリセットを追加し、`input.jpg` → `output.svg` の流れを確立。
-- [ ] **Phase 2: AI推論エンジンの統合（前処理）** — `ort` と `Real-ESRGAN/SwinIR` のONNXモデルを読み込み、`image::DynamicImage` と `ndarray::Array4<f32>` の相互変換を実装する。
+- [x] **Phase 2: AI推論エンジンの統合（前処理）** — `ort` と `Real-ESRGAN/SwinIR` のONNXモデルを読み込み、`image::DynamicImage` と `ndarray::Array4<f32>` の相互変換を実装する。
 - [ ] **Phase 3: パイプラインの結合とメモリ最適化** — 超解像結果をメモリ上で `vtracer` に渡し、ディスクI/Oを挟まずに高速ベクター化する。大判画像への自動リサイズも盛り込む。
 - [ ] **Phase 4: 品質チューニング（High Precision Mode）** — 量子化オプション、前処理フィルター強化、SVGパスのスムージングを追加して「非常に高精度」と言える仕上がりにする。
 - [ ] **Phase 5: 配布用パッケージング** — エラーハンドリング強化、進行状況バー導入、`cargo build --release` での配布バイナリ整備。
@@ -18,6 +18,33 @@ Rust製のPDF解析機能をPythonから利用できるようにした拡張モ�
 
 ### 今後の進め方
 Phase 2以降は上記のロードマップに沿って、AI超解像（`ort` + ONNXモデル）→オンメモリ連携→品質チューニングの順で機能を追加していきます。各フェーズ完了ごとにREADMEへ進捗を追記し、使い方やパラメータの推奨値も更新予定です。
+
+### Phase 2で追加したもの（AI前処理）
+- `ort` を用いた ONNX Runtime のラッパー `SuperResolutionEngine` を実装し、Real-ESRGAN/SwinIR のモデルをそのまま読み込んで推論できるようにしました。
+- `image::DynamicImage` と `ndarray::Array4<f32>`（NCHWレイアウト）の相互変換ヘルパーを用意し、RGB/BGRのチャンネル順を指定して0〜1へ正規化・復元できます。
+- Real-ESRGAN/SwinIR の公開ONNXモデルをダウンロードする CLI `download_models` を追加しました（既存ファイルはスキップ）。
+
+#### 変換・推論の使い方（Rust）
+```rust
+use image::open;
+use pdfmodule::ai::{
+    dynamic_image_to_nchw_f32, nchw_f32_to_dynamic_image, ChannelOrder,
+    SuperResolutionEngine, REALESRGAN_X4PLUS_ONNX,
+};
+
+let input = open("input.png")?;
+let tensor = dynamic_image_to_nchw_f32(&input, ChannelOrder::Bgr);
+let engine = SuperResolutionEngine::from_onnx("models/realesrgan-x4plus.onnx")?;
+let output_tensor = engine.run(&tensor)?;
+let upscaled = nchw_f32_to_dynamic_image(&output_tensor, ChannelOrder::Bgr)?;
+upscaled.save("upscaled.png")?;
+```
+
+#### ONNXモデルのダウンロード
+```bash
+cargo run --bin download_models -- --output-dir models
+```
+`models/realesrgan-x4plus.onnx` と `models/swinir_x4.onnx` が保存されます。
 
 ## 機能
 - **ページ数の取得**: `get_page_count(path: str) -> int` がPDFの総ページ数を返します。
