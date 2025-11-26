@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, ValueEnum};
 use image::DynamicImage;
-use image::imageops::FilterType;
+use image::imageops::{FilterType, blur, unsharpen};
 use pdfmodule::ai::{
     ChannelOrder, SuperResolutionEngine, dynamic_image_to_nchw_f32, nchw_f32_to_dynamic_image,
 };
-use vtracer::{ColorImage, ColorMode, Config, Hierarchical, Mode, conversion};
+use visioncortex::{CompoundPath, PathSimplifyMode};
+use vtracer::{ColorImage, ColorMode, Config, Hierarchical, SvgFile, conversion};
 
 #[derive(Debug, Clone, ValueEnum)]
 enum ColorChoice {
@@ -28,11 +29,20 @@ enum ModeChoice {
 }
 
 #[derive(Debug, Clone, ValueEnum)]
+enum PrecisionChoice {
+    Illustration,
+    Natural,
+    HighPrecision,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
 enum PresetChoice {
     /// イラストやマンガ線画を前提に、ノイズ除去と曲線の滑らかさを重視したプリセット
     Illustration,
     /// 写実的な写真など、色数やエッジ保持を優先する汎用プリセット
     Natural,
+    /// 色の段差やエッジをできるだけ保持する高精度プリセット
+    HighPrecision,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -67,9 +77,21 @@ struct Args {
     #[arg(long)]
     colors: Option<usize>,
 
+    /// Number of bits to keep per channel during quantization (1-8)
+    #[arg(long)]
+    color_precision: Option<i32>,
+
+    /// Difference threshold between quantized layers
+    #[arg(long)]
+    layer_difference: Option<i32>,
+
     /// Tuned presets for typical use-cases
     #[arg(long, value_enum, default_value_t = PresetChoice::Illustration)]
     preset: PresetChoice,
+
+    /// Quality preset tuned for high precision output
+    #[arg(long, value_enum, default_value_t = PrecisionChoice::Illustration)]
+    quality: PrecisionChoice,
 
     /// Optional ONNX super-resolution model to run before tracing
     #[arg(long)]
@@ -107,13 +129,53 @@ struct Args {
     #[arg(long)]
     path_precision: Option<f64>,
 
-    /// Whether to round SVG coordinates to integers
+    /// Apply a Gaussian blur before vectorization to tame noise
     #[arg(long)]
-    round_coords: Option<bool>,
+    denoise_radius: Option<f32>,
 
-    /// Toggle path optimization (smoothing and simplification)
+    /// Apply unsharp masking after denoise to restore edges
     #[arg(long)]
-    optimize_paths: Option<bool>,
+    unsharp_sigma: Option<f32>,
+
+    /// Threshold for the unsharp mask (0-255)
+    #[arg(long)]
+    unsharp_threshold: Option<i32>,
+
+    /// Increase contrast to help quantization separate tones
+    #[arg(long)]
+    enhance_contrast: Option<f32>,
+
+    /// Smooth the SVG paths after tracing
+    #[arg(long)]
+    smooth_paths: Option<bool>,
+
+    /// Corner sharpness used when smoothing SVG paths
+    #[arg(long)]
+    smooth_corner_threshold: Option<f64>,
+
+    /// Outset ratio used when smoothing SVG paths
+    #[arg(long)]
+    smooth_outset_ratio: Option<f64>,
+
+    /// Target segment length (in px) used when smoothing SVG paths
+    #[arg(long)]
+    smooth_segment_length: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct PreprocessSettings {
+    denoise_radius: Option<f32>,
+    unsharp_sigma: Option<f32>,
+    unsharp_threshold: Option<i32>,
+    enhance_contrast: Option<f32>,
+}
+
+#[derive(Debug, Clone)]
+struct SmoothingSettings {
+    enabled: bool,
+    corner_threshold: f64,
+    outset_ratio: f64,
+    segment_length: f64,
 }
 
 fn main() -> Result<(), String> {
@@ -125,7 +187,7 @@ fn main() -> Result<(), String> {
         .unwrap_or_else(|| default_output(&args.input));
 
     let mut config = Config::default();
-    config.colormode = match args.color_mode {
+    config.color_mode = match args.color_mode {
         ColorChoice::Color => ColorMode::Color,
         ColorChoice::Binary => ColorMode::Binary,
     };
@@ -134,14 +196,23 @@ fn main() -> Result<(), String> {
         HierarchyChoice::Cutout => Hierarchical::Cutout,
     };
     config.mode = match args.mode {
-        ModeChoice::Spline => Mode::Spline,
-        ModeChoice::Polygon => Mode::Polygon,
+        ModeChoice::Spline => PathSimplifyMode::Spline,
+        ModeChoice::Polygon => PathSimplifyMode::Polygon,
     };
 
     apply_preset(&mut config, &args.preset);
+    apply_quality(&mut config, &args.quality);
 
     if let Some(colors) = args.colors {
-        config.colors = colors;
+        config.color_precision = palette_size_to_bits(colors, config.color_precision);
+    }
+
+    if let Some(color_precision) = args.color_precision {
+        config.color_precision = color_precision.clamp(1, 8);
+    }
+
+    if let Some(layer_difference) = args.layer_difference {
+        config.layer_difference = layer_difference.max(0);
     }
 
     if let Some(filter_speckle) = args.filter_speckle {
@@ -149,7 +220,7 @@ fn main() -> Result<(), String> {
     }
 
     if let Some(corner_threshold) = args.corner_threshold {
-        config.corner_threshold = corner_threshold;
+        config.corner_threshold = corner_threshold.round() as i32;
     }
 
     if let Some(length_threshold) = args.length_threshold {
@@ -161,20 +232,15 @@ fn main() -> Result<(), String> {
     }
 
     if let Some(splice_threshold) = args.splice_threshold {
-        config.splice_threshold = splice_threshold;
+        config.splice_threshold = splice_threshold.round() as i32;
     }
 
     if let Some(path_precision) = args.path_precision {
-        config.path_precision = path_precision;
+        config.path_precision = Some(path_precision.round() as u32);
     }
 
-    if let Some(round_coords) = args.round_coords {
-        config.round_coords = round_coords;
-    }
-
-    if let Some(optimize_paths) = args.optimize_paths {
-        config.optimize_paths = optimize_paths;
-    }
+    let preprocess_settings = resolve_preprocess_settings(&args);
+    let smoothing_settings = resolve_smoothing_settings(&args);
 
     let raster = image::open(&args.input)
         .map_err(|e| format!("failed to open input image {}: {e}", args.input.display()))?;
@@ -199,8 +265,10 @@ fn main() -> Result<(), String> {
         prepared
     };
 
-    let color_image = dynamic_image_to_color_image(&enhanced);
+    let prefiltered = apply_pre_filters(&enhanced, &preprocess_settings);
+    let color_image = dynamic_image_to_color_image(&prefiltered);
     let svg = conversion::convert(color_image, config)?;
+    let svg = smooth_svg(svg, &smoothing_settings);
     fs::write(&output, svg.to_string())
         .map_err(|e| format!("failed to write SVG to {}: {e}", output.display()))?;
 
@@ -217,24 +285,181 @@ fn default_output(input: &Path) -> PathBuf {
 fn apply_preset(config: &mut Config, preset: &PresetChoice) {
     match preset {
         PresetChoice::Illustration => {
-            // イラストや線画向け: 少ない色数・強めのノイズ除去・曲線優先の設定
-            config.colors = config.colors.min(12);
+            // イラストや線画向け: 強めのノイズ除去と曲線優先の設定
+            config.color_precision = 6;
+            config.layer_difference = 12;
             config.filter_speckle = 4;
-            config.corner_threshold = 85.0;
-            config.length_threshold = 2.0;
-            config.splice_threshold = 0.6;
+            config.corner_threshold = 85;
+            config.length_threshold = 2.2;
+            config.splice_threshold = 40;
             config.max_iterations = 12;
-            config.path_precision = 2.0;
-            config.round_coords = true;
-            config.optimize_paths = true;
+            config.path_precision = Some(3);
         }
         PresetChoice::Natural => {
             // 汎用向け: vtracerのデフォルトを尊重しつつ、座標の丸めを抑えてディテールを保持
-            config.colors = config.colors.max(16);
-            config.round_coords = false;
-            config.optimize_paths = true;
+            config.color_precision = 7;
+            config.layer_difference = 16;
+            config.filter_speckle = 3;
+            config.corner_threshold = 95;
+            config.length_threshold = 3.0;
+            config.splice_threshold = 45;
+            config.max_iterations = 12;
+            config.path_precision = Some(3);
+        }
+        PresetChoice::HighPrecision => {
+            // 高精度: 色の保持と滑らかなパス生成を最優先
+            config.color_precision = 8;
+            config.layer_difference = 10;
+            config.filter_speckle = 2;
+            config.corner_threshold = 120;
+            config.length_threshold = 1.8;
+            config.splice_threshold = 35;
+            config.max_iterations = 16;
+            config.path_precision = Some(4);
         }
     }
+}
+
+fn apply_quality(config: &mut Config, quality: &PrecisionChoice) {
+    if matches!(quality, PrecisionChoice::HighPrecision) {
+        config.color_precision = config.color_precision.max(8);
+        config.path_precision = config.path_precision.map(|p| p.max(4)).or(Some(4));
+        config.length_threshold = (config.length_threshold * 0.8).max(0.5);
+    }
+}
+
+fn palette_size_to_bits(palette_size: usize, fallback: i32) -> i32 {
+    if palette_size == 0 {
+        return fallback;
+    }
+    let bits = (palette_size as f64).log2().ceil() as i32;
+    bits.clamp(1, 8)
+}
+
+fn resolve_preprocess_settings(args: &Args) -> PreprocessSettings {
+    let defaults = match args.quality {
+        PrecisionChoice::Illustration => PreprocessSettings {
+            denoise_radius: Some(0.8),
+            unsharp_sigma: Some(1.0),
+            unsharp_threshold: Some(2),
+            enhance_contrast: Some(3.0),
+        },
+        PrecisionChoice::Natural => PreprocessSettings {
+            denoise_radius: Some(0.5),
+            unsharp_sigma: Some(0.8),
+            unsharp_threshold: Some(1),
+            enhance_contrast: Some(2.0),
+        },
+        PrecisionChoice::HighPrecision => PreprocessSettings {
+            denoise_radius: Some(1.0),
+            unsharp_sigma: Some(1.2),
+            unsharp_threshold: Some(2),
+            enhance_contrast: Some(4.0),
+        },
+    };
+
+    PreprocessSettings {
+        denoise_radius: args.denoise_radius.or(defaults.denoise_radius),
+        unsharp_sigma: args.unsharp_sigma.or(defaults.unsharp_sigma),
+        unsharp_threshold: args.unsharp_threshold.or(defaults.unsharp_threshold),
+        enhance_contrast: args.enhance_contrast.or(defaults.enhance_contrast),
+    }
+}
+
+fn resolve_smoothing_settings(args: &Args) -> SmoothingSettings {
+    let defaults = match args.quality {
+        PrecisionChoice::Illustration => SmoothingSettings {
+            enabled: true,
+            corner_threshold: 100.0,
+            outset_ratio: 0.2,
+            segment_length: 6.0,
+        },
+        PrecisionChoice::Natural => SmoothingSettings {
+            enabled: true,
+            corner_threshold: 95.0,
+            outset_ratio: 0.18,
+            segment_length: 7.0,
+        },
+        PrecisionChoice::HighPrecision => SmoothingSettings {
+            enabled: true,
+            corner_threshold: 110.0,
+            outset_ratio: 0.16,
+            segment_length: 5.5,
+        },
+    };
+
+    SmoothingSettings {
+        enabled: args.smooth_paths.unwrap_or(defaults.enabled),
+        corner_threshold: args
+            .smooth_corner_threshold
+            .unwrap_or(defaults.corner_threshold),
+        outset_ratio: args.smooth_outset_ratio.unwrap_or(defaults.outset_ratio),
+        segment_length: args
+            .smooth_segment_length
+            .unwrap_or(defaults.segment_length),
+    }
+}
+
+fn apply_pre_filters(image: &DynamicImage, settings: &PreprocessSettings) -> DynamicImage {
+    let mut processed = image.clone();
+
+    if let Some(radius) = settings.denoise_radius {
+        if radius > 0.0 {
+            processed = blur(&processed, radius);
+        }
+    }
+
+    if let (Some(sigma), Some(threshold)) = (settings.unsharp_sigma, settings.unsharp_threshold) {
+        if sigma > 0.0 && threshold >= 0 {
+            processed = unsharpen(&processed, sigma, threshold);
+        }
+    }
+
+    if let Some(contrast) = settings.enhance_contrast {
+        if contrast.abs() > f32::EPSILON {
+            processed = processed.adjust_contrast(contrast as f64);
+        }
+    }
+
+    processed
+}
+
+fn smooth_svg(svg: SvgFile, settings: &SmoothingSettings) -> SvgFile {
+    if !settings.enabled {
+        return svg;
+    }
+
+    let mut output = SvgFile {
+        paths: Vec::with_capacity(svg.paths.len()),
+        width: svg.width,
+        height: svg.height,
+        path_precision: svg.path_precision,
+    };
+
+    for path in svg.paths {
+        let smoothed = smooth_compound_path(
+            path.path,
+            settings.corner_threshold,
+            settings.outset_ratio,
+            settings.segment_length,
+        );
+        output.add_path(smoothed, path.color);
+    }
+
+    output
+}
+
+fn smooth_compound_path(
+    path: CompoundPath,
+    corner_threshold: f64,
+    outset_ratio: f64,
+    segment_length: f64,
+) -> CompoundPath {
+    if corner_threshold <= 0.0 || segment_length <= 0.0 {
+        return path;
+    }
+
+    path.smooth(corner_threshold, outset_ratio, segment_length)
 }
 
 fn dynamic_image_to_color_image(image: &DynamicImage) -> ColorImage {
