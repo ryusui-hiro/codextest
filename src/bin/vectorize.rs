@@ -21,6 +21,14 @@ enum ModeChoice {
     Polygon,
 }
 
+#[derive(Debug, Clone, ValueEnum)]
+enum PresetChoice {
+    /// イラストやマンガ線画を前提に、ノイズ除去と曲線の滑らかさを重視したプリセット
+    Illustration,
+    /// 写実的な写真など、色数やエッジ保持を優先する汎用プリセット
+    Natural,
+}
+
 #[derive(Debug, Parser)]
 #[command(about = "Convert a raster image into an SVG vector using vtracer.")]
 struct Args {
@@ -44,8 +52,12 @@ struct Args {
     mode: ModeChoice,
 
     /// Maximum number of colors to keep after quantization
-    #[arg(long, default_value_t = 16)]
-    colors: usize,
+    #[arg(long)]
+    colors: Option<usize>,
+
+    /// Tuned presets for typical use-cases
+    #[arg(long, value_enum, default_value_t = PresetChoice::Illustration)]
+    preset: PresetChoice,
 
     /// Remove small speckles in the traced result (0 disables filtering)
     #[arg(long)]
@@ -88,22 +100,25 @@ fn main() -> Result<(), String> {
         .clone()
         .unwrap_or_else(|| default_output(&args.input));
 
-    let mut config = Config {
-        colormode: match args.color_mode {
-            ColorChoice::Color => ColorMode::Color,
-            ColorChoice::Binary => ColorMode::Binary,
-        },
-        hierarchical: match args.hierarchy {
-            HierarchyChoice::Stacked => Hierarchical::Stacked,
-            HierarchyChoice::Cutout => Hierarchical::Cutout,
-        },
-        mode: match args.mode {
-            ModeChoice::Spline => Mode::Spline,
-            ModeChoice::Polygon => Mode::Polygon,
-        },
-        colors: args.colors,
-        ..Default::default()
+    let mut config = Config::default();
+    config.colormode = match args.color_mode {
+        ColorChoice::Color => ColorMode::Color,
+        ColorChoice::Binary => ColorMode::Binary,
     };
+    config.hierarchical = match args.hierarchy {
+        HierarchyChoice::Stacked => Hierarchical::Stacked,
+        HierarchyChoice::Cutout => Hierarchical::Cutout,
+    };
+    config.mode = match args.mode {
+        ModeChoice::Spline => Mode::Spline,
+        ModeChoice::Polygon => Mode::Polygon,
+    };
+
+    apply_preset(&mut config, &args.preset);
+
+    if let Some(colors) = args.colors {
+        config.colors = colors;
+    }
 
     if let Some(filter_speckle) = args.filter_speckle {
         config.filter_speckle = filter_speckle;
@@ -147,4 +162,27 @@ fn default_output(input: &Path) -> PathBuf {
     let mut candidate = input.to_path_buf();
     candidate.set_extension("svg");
     candidate
+}
+
+fn apply_preset(config: &mut Config, preset: &PresetChoice) {
+    match preset {
+        PresetChoice::Illustration => {
+            // イラストや線画向け: 少ない色数・強めのノイズ除去・曲線優先の設定
+            config.colors = config.colors.min(12);
+            config.filter_speckle = 4;
+            config.corner_threshold = 85.0;
+            config.length_threshold = 2.0;
+            config.splice_threshold = 0.6;
+            config.max_iterations = 12;
+            config.path_precision = 2.0;
+            config.round_coords = true;
+            config.optimize_paths = true;
+        }
+        PresetChoice::Natural => {
+            // 汎用向け: vtracerのデフォルトを尊重しつつ、座標の丸めを抑えてディテールを保持
+            config.colors = config.colors.max(16);
+            config.round_coords = false;
+            config.optimize_paths = true;
+        }
+    }
 }

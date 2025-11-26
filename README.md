@@ -2,6 +2,23 @@
 
 Rust製のPDF解析機能をPythonから利用できるようにした拡張モジュールです。PDFファイルからテキスト・画像・描画パスなどを抽出し、座標情報付きで扱うことができます。
 
+## Rust製 AI搭載・高精度ベクター変換エンジン (Rust-AI-Vectorizer) 計画と進捗
+「Vectorizer.ai」と同等の品質を目指し、AIによる超解像を前処理、`vtracer` によるベクター化を後処理とするCLIツールを段階的に育てていきます。画像品質を落とさずSVG化することをゴールに、フェーズごとにREADMEを更新しながら進行状況を記録します。
+
+### 進捗ログ
+- [x] **Phase 1: ベースラインの実装（純粋なベクター変換）** — `vtracer` + `clap` でラスタ画像をSVG化するCLIを実装。イラスト向けにノイズ除去と曲線の滑らかさを優先するプリセットを追加し、`input.jpg` → `output.svg` の流れを確立。
+- [ ] **Phase 2: AI推論エンジンの統合（前処理）** — `ort` と `Real-ESRGAN/SwinIR` のONNXモデルを読み込み、`image::DynamicImage` と `ndarray::Array4<f32>` の相互変換を実装する。
+- [ ] **Phase 3: パイプラインの結合とメモリ最適化** — 超解像結果をメモリ上で `vtracer` に渡し、ディスクI/Oを挟まずに高速ベクター化する。大判画像への自動リサイズも盛り込む。
+- [ ] **Phase 4: 品質チューニング（High Precision Mode）** — 量子化オプション、前処理フィルター強化、SVGパスのスムージングを追加して「非常に高精度」と言える仕上がりにする。
+- [ ] **Phase 5: 配布用パッケージング** — エラーハンドリング強化、進行状況バー導入、`cargo build --release` での配布バイナリ整備。
+
+### これまでに行ったこと（Phase 1）
+- `vectorize` CLI を整備し、`vtracer` の主要パラメータ（`colormode`、`hierarchical`、`mode` など）をCLI引数から指定可能にしました。
+- イラスト向けのプリセットを新設し、ノイズ除去強め・曲線滑らかめの設定をワンコマンドで適用できるようにしました（詳細は下記CLIの章を参照）。
+
+### 今後の進め方
+Phase 2以降は上記のロードマップに沿って、AI超解像（`ort` + ONNXモデル）→オンメモリ連携→品質チューニングの順で機能を追加していきます。各フェーズ完了ごとにREADMEへ進捗を追記し、使い方やパラメータの推奨値も更新予定です。
+
 ## 機能
 - **ページ数の取得**: `get_page_count(path: str) -> int` がPDFの総ページ数を返します。
 - **テキスト抽出**: `extract_text_with_coords(path: str, page_index: int)` は指定ページのテキストを行ごとの辞書リストで返します。各辞書には `type`, `text`, `x`, `y`, `x0`, `y0`, `x1`, `y1` が含まれ、ベースライン座標とバウンディングボックスを確認できます。
@@ -75,8 +92,11 @@ for layout in layouts:
 # 入力画像を同名の .svg に変換
 vectorize input.png
 
-# 出力パスやモードを指定
-vectorize input.jpg --output output.svg --color-mode binary --hierarchy cutout --mode polygon --colors 8
+# 出力パスやモードを指定（イラスト向けプリセットがデフォルト）
+vectorize input.jpg --output output.svg --color-mode binary --hierarchy cutout --mode polygon
+
+# 写真向けにプリセットを切り替え、色数を上書き
+vectorize input.png --preset natural --colors 24
 
 # パスの最適化パラメータも上書き可能
 vectorize input.png --filter-speckle 2 --corner-threshold 80 --path-precision 2 --round-coords true
@@ -86,7 +106,8 @@ vectorize input.png --filter-speckle 2 --corner-threshold 80 --path-precision 2 
 - `--color-mode [color|binary]`: カラーモード指定。
 - `--hierarchy [stacked|cutout]`: パスの積層方法。
 - `--mode [spline|polygon]`: スプラインかポリゴンか。
-- `--colors <N>`: 量子化する色数。
+- `--preset [illustration|natural]`: 利用シーンに合わせたプリセット（デフォルトは `illustration`）。
+- `--colors <N>`: 量子化する色数（プリセットを上書きしたい場合に指定）。
 - `--filter-speckle <N>`: 小さなゴミを除去するピクセル閾値。
 - `--corner-threshold <角度>` / `--length-threshold <長さ>` / `--splice-threshold <値>`: パス簡略化のしきい値。
 - `--max-iterations <N>`: ベジェ近似の最大繰り返し回数。
