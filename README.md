@@ -9,7 +9,7 @@ Rust製のPDF解析機能をPythonから利用できるようにした拡張モ�
 - [x] **Phase 1: ベースラインの実装（純粋なベクター変換）** — `vtracer` + `clap` でラスタ画像をSVG化するCLIを実装。イラスト向けにノイズ除去と曲線の滑らかさを優先するプリセットを追加し、`input.jpg` → `output.svg` の流れを確立。
 - [x] **Phase 2: AI推論エンジンの統合（前処理）** — `ort` と `Real-ESRGAN/SwinIR` のONNXモデルを読み込み、`image::DynamicImage` と `ndarray::Array4<f32>` の相互変換を実装する。
 - [x] **Phase 3: パイプラインの結合とメモリ最適化** — 超解像結果をメモリ上で `vtracer` に渡し、ディスクI/Oを挟まずに高速ベクター化する。大判画像への自動リサイズも盛り込む。
-- [ ] **Phase 4: 品質チューニング（High Precision Mode）** — 量子化オプション、前処理フィルター強化、SVGパスのスムージングを追加して「非常に高精度」と言える仕上がりにする。
+- [x] **Phase 4: 品質チューニング（High Precision Mode）** — 量子化オプション、前処理フィルター強化、SVGパスのスムージングを追加して「非常に高精度」と言える仕上がりにする。
 - [ ] **Phase 5: 配布用パッケージング** — エラーハンドリング強化、進行状況バー導入、`cargo build --release` での配布バイナリ整備。
 
 ### これまでに行ったこと（Phase 1）
@@ -28,6 +28,11 @@ Phase 2以降は上記のロードマップに沿って、AI超解像（`ort` + 
 - `vectorize` CLI に超解像ONNXモデルを指定する `--superres-model` オプションを追加し、`image -> tensor -> image -> SVG` の流れを全てメモリ上で処理するようにしました。推論結果の画像は `vtracer` の `ColorImage` に直接変換し、ディスクI/Oを挟みません。
 - Real-ESRGANなどで一般的なBGR入力に合わせてチャンネル順を切り替える `--channel-order` を新設しました（デフォルトBGR）。
 - メモリ節約と推論速度のため、入力/出力の最大辺を `--max-dimension` で指定し、大判画像は自動リサイズした上で超解像・ベクター化します（デフォルト4096px）。
+
+### Phase 4で追加したもの（High Precision Mode）
+- 量子化の粒度を `--color-precision`（1〜8bit）と `--layer-difference` で細かく指定できるようにし、従来の `--colors` もパレット数から自動的にビット深度へマッピングするようにしました。
+- 前処理フィルターを強化し、`--denoise-radius`（ガウシアンぼかし）、`--unsharp-sigma`/`--unsharp-threshold`（アンシャープマスク）、`--enhance-contrast` を組み合わせて超解像後のラスタを「非常に高精度」に整形できます。`--quality high-precision` で高精度向けの既定値がまとまって適用されます。
+- `--smooth-paths` と `--smooth-corner-threshold` などのスムージングパラメータを追加し、`visioncortex` のパス平滑化を自動で走らせることでSVGパスをより滑らかに仕上げます。
 
 #### 変換・推論の使い方（Rust）
 ```rust
@@ -138,13 +143,17 @@ vectorize input.png --filter-speckle 2 --corner-threshold 80 --path-precision 2 
 - `--color-mode [color|binary]`: カラーモード指定。
 - `--hierarchy [stacked|cutout]`: パスの積層方法。
 - `--mode [spline|polygon]`: スプラインかポリゴンか。
-- `--preset [illustration|natural]`: 利用シーンに合わせたプリセット（デフォルトは `illustration`）。
-- `--colors <N>`: 量子化する色数（プリセットを上書きしたい場合に指定）。
+- `--preset [illustration|natural|high-precision]`: 利用シーンに合わせたプリセット（デフォルトは `illustration`）。
+- `--quality [illustration|natural|high-precision]`: 前処理・スムージングのまとまったチューニングを適用。
+- `--colors <N>`: 量子化する色数（パレット数から自動でビット深度へ変換）。
+- `--color-precision <1-8>` / `--layer-difference <N>`: 量子化のビット深度とレイヤーの分離度を直接指定。
 - `--filter-speckle <N>`: 小さなゴミを除去するピクセル閾値。
 - `--corner-threshold <角度>` / `--length-threshold <長さ>` / `--splice-threshold <値>`: パス簡略化のしきい値。
 - `--max-iterations <N>`: ベジェ近似の最大繰り返し回数。
-- `--path-precision <桁数>` / `--round-coords <true|false>`: SVG座標の精度や丸め設定。
-- `--optimize-paths <true|false>`: パス最適化のオン/オフ。
+- `--path-precision <桁数>`: SVG座標の精度。
+- `--denoise-radius <px>` / `--unsharp-sigma <float>` / `--unsharp-threshold <0-255>` / `--enhance-contrast <float>`: 前処理フィルターの
+  強さを指定。
+- `--smooth-paths <true|false>` / `--smooth-corner-threshold <角度>` / `--smooth-outset-ratio <比率>` / `--smooth-segment-length <長さ>`: SVGパスのスムージング挙動。
 - `--superres-model <path>`: 超解像ONNXモデルを指定し、オンメモリで前処理してからベクター化。
 - `--channel-order [rgb|bgr]`: モデルが期待するチャンネル順を切り替え（デフォルトBGR）。
 - `--max-dimension <px>`: 入力/出力画像の最大辺。超過する場合は自動リサイズしてメモリ使用量を抑制。
